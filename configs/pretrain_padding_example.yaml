@@ -1,0 +1,76 @@
+mode: pretrain
+
+name: minimind_gpt2_padding_example
+
+model:
+  name: gpt2
+  config:
+    vocab_size: 6400
+    n_layer: 8
+    n_head: 8
+    n_embd: 768
+
+training:
+  batch_size: 16
+  seq_len: 1024
+  epoch_num: 1
+  learning_rate: 0.0003
+  warmup_steps: 100
+  grad_clip: 1.0
+  accumulation_steps: 1
+  log_steps: 10
+  seed: 42
+  amp: true
+  amp_dtype: bf16
+
+
+checkpoint:
+  save_steps: 1000
+  checkpoint_dir: checkpoints/pretrain
+  resume_from_checkpoint: null
+
+data:
+  data_strategy: 'padding'
+  dataset_config:
+    dataset_path: 'jingyaogong/minimind_dataset'
+    dataset_name: 'default'
+    tokenizer_path: 'jingyaogong/minimind-3'
+    split: 'train'
+    data_files: ['pretrain_t2t_mini.jsonl']
+    col_name: 'text'
+    add_bos_id: false
+    add_eos_id: true
+  dataloader_config:
+    shuffle: true
+    num_workers: 4
+    pin_memory: false
+    drop_last: false
+    persistent_workers: false
+    seed: 42
+
+eval:
+  steps: 1000
+  dataset_path: json
+  dataset_name: ""
+  data_files:
+    train: train_data/pretrain_t2t_eval_unseen_1024.jsonl
+  split: train
+  text_column: text
+  tokenizer_path: jingyaogong/minimind-3
+  max_samples: 1024
+  batch_size: 8
+  add_bos_id: false
+  add_eos_id: true
+  checkpoint_step: null
+
+optimizer:
+  name: adamw
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+swanlab:
+  enabled: false
+  project: llm-pretrain
+  experiment_name: pretrain-padding-example
+  tags: []

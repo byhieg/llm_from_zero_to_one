@@ -1,0 +1,56 @@
+mode: pretrain
+
+name: minimind_gpt2_megatron_example
+
+model:
+  name: gpt2
+  config:
+    vocab_size: 6400
+    n_layer: 8
+    n_head: 8
+    n_embd: 768
+
+training:
+  batch_size: 16
+  seq_len: 1024
+  epoch_num: 1
+  learning_rate: 0.0003
+  warmup_steps: 100
+  grad_clip: 1.0
+  accumulation_steps: 1
+  log_steps: 10
+  seed: 42
+  amp: true
+  amp_dtype: bf16
+
+checkpoint:
+  save_steps: 1000
+  checkpoint_dir: checkpoints/pretrain
+  resume_from_checkpoint: null
+
+data:
+  data_strategy: 'megatron'
+  dataset_config:
+    dataset_path: 'train_data/minimind_dataset'
+    seq_len: 1024
+    total_token: 10000000
+    seed: 42
+  dataloader_config:
+    shuffle: true
+    num_workers: 4
+    pin_memory: false
+    drop_last: false
+    persistent_workers: false
+    seed: 42
+
+optimizer:
+  name: adamw
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+swanlab:
+  enabled: false
+  project: llm-pretrain
+  experiment_name: pretrain-megatron-example
+  tags: []
