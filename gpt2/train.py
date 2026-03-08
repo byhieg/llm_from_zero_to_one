@@ -2,17 +2,19 @@ from dataclasses import dataclass
 import torch
 import random
 from typing import Iterator
+from torch import cuda
 from torch.utils.data import DataLoader, Sampler
 from gpt2.data import ShardIndexDataset
+from gpt2.model import GPTConfig, GPT2
 
 
 @dataclass
-class ModelConfig:
+class TrainConfig:
     total_tokens: int = 320 * 1024
     batch_tokens: int = 16 * 1024
-    batch_size: int = 16
+    batch_size: int = 1
     seq_len: int = 1024
-    epoch_num: int = 3
+    epoch_num: int = 1
 
 
 class RandomStartSampler(Sampler):
@@ -76,26 +78,33 @@ class RandomStartSampler(Sampler):
 
 
 if __name__ == "__main__":
-    gpt2_config = ModelConfig()
-    ds = ShardIndexDataset("gpt2/data", seq_len=gpt2_config.seq_len)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    train_config = TrainConfig()
+    ds = ShardIndexDataset("gpt2/data", seq_len=train_config.seq_len)
     # 使用自定义 RandomStartSampler 替代 shuffle，以实现每个 epoch 的随机起始
     sampler = RandomStartSampler(
         data_source=ds,
-        batch_size=gpt2_config.batch_size,
+        batch_size=train_config.batch_size,
         drop_last=True,
     )
     loader = DataLoader(
-        ds, batch_size=gpt2_config.batch_size, sampler=sampler, drop_last=True
+        ds,
+        batch_size=train_config.batch_size,
+        sampler=sampler,
+        drop_last=True,
+        num_workers=1,
     )
-    for epoch in range(gpt2_config.epoch_num):
-        print(f"current epoch:{epoch}")
+
+    model = GPT2(GPTConfig())
+    model = model.to(device)
+    for epoch in range(train_config.epoch_num):
         # 每个 epoch 启动前设置随机起始索引
         sampler.set_epoch(epoch)
         for step, batch in enumerate(loader):
-            x: torch.Tensor
-            y: torch.Tensor
-            x = batch[0]  # type: torch.Tensor
-            y = batch[1]  # type: torch.Tensor
-            print(f"Step {step}: x.shape={x.shape}, y.shape={y.shape}")
-            if step >= 2:  
+            x = batch[0].to(device)
+            y = batch[1].to(device)
+            logits, loss = model(x, y)
+            print(f"loss:{loss}")
+            if step == 2:
                 break

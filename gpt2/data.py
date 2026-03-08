@@ -85,8 +85,3 @@ class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
         raise ValueError(f"can not get index {index} in data shard ")
 
-
-ds = ShardIndexDataset("gpt2/data", seq_len=1024)
-
-loader = DataLoader(ds, batch_size=16, shuffle=False, drop_last=True)
-print(next(iter(loader)))
