@@ -1,66 +1,92 @@
-from dataclasses import dataclass
-from datasets import load_dataset
-import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+import json
 import numpy as np
-import tiktoken
-from multiprocessing import Pool
-from tqdm import tqdm
-
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-current_dir = os.path.dirname(os.path.abspath(__file__))
+from typing import Dict, Any
 
 
-@dataclass
-class DatasetConfig:
-    name: str = "roneneldan/TinyStories"
-    shard: int = 8
-    tokenizer_model: str = "gpt2"
-    split: str = "train"
-    cache_dir: str = f"{current_dir}/cache"
-    data_dir: str = f"{current_dir}/data"
+class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    def __init__(self, data_path: str, seq_len: int):
+        super().__init__()
+        self.data_path = Path(data_path)
+        self.seq_len = seq_len
+        assert self.data_path.exists(), f"{data_path} need exist"
+        with Path(self.data_path / "meta.json").open("r", encoding="utf-8") as f:
+            self.data_meta: Dict[str, Dict[str, Any]] = json.load(f)
+
+        self.length = sum(v["tokens"] for v in self.data_meta.values())
+        self.total_shard = int(max(self.data_meta.keys())) + 1
+        self.shard_sample_range: dict[str, int] = {
+            k: v["tokens"] for k, v in self.data_meta.items()
+        }
+        self.shard_data = {}
+
+    def __len__(
+        self,
+    ) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        result = self._get_shard_by_index(idx)  # type: ignore[return-value]
+        shard_id = str(result[0])
+        local_index = int(result[1])
+        # Ensure shard_id is a string for dict key access and compatibility with dynamic typing
+        shard_id = str(shard_id)
+        # 加载当前 shard（如果尚未加载）
+        if shard_id not in self.shard_data:
+            shard_data = np.load(
+                Path(self.data_path / self.data_meta[shard_id]["file_path"]),
+                mmap_mode="r",
+            )
+            self.shard_data[shard_id] = shard_data
+
+        # 读取所需的 token 数量（seq_len + 1，用于构建 input 和 label）
+        needed_tokens = self.seq_len + 1
+        current_shard_size = self.data_meta[shard_id]["tokens"]
+        current_shard_remaining = current_shard_size - local_index
+
+        if current_shard_remaining >= needed_tokens:
+            # 当前 shard 可以一次性提供所需 tokens
+            tokens = self.shard_data[shard_id][
+                local_index : local_index + needed_tokens
+            ]
+        else:
+            # 跨 shard 读取
+            if int(shard_id) == self.total_shard - 1:
+                next_shard = "0"
+            else:
+                next_shard = str(int(shard_id) + 1)
+
+            if next_shard not in self.shard_data:
+                shard_data = np.load(
+                    Path(self.data_path / self.data_meta[next_shard]["file_path"]),
+                    mmap_mode="r",
+                )
+                self.shard_data[next_shard] = shard_data
+
+            # 从当前 shard 读取剩余部分，从下一个 shard 读取需要的部分
+            tokens_from_current = self.shard_data[shard_id][local_index:]
+            tokens_from_next = self.shard_data[next_shard][
+                : needed_tokens - current_shard_remaining
+            ]
+            tokens = np.concatenate([tokens_from_current, tokens_from_next])
+
+        tokens = torch.from_numpy(tokens.astype(self.data_meta[shard_id]["type"]))
+        return tokens[:-1], tokens[1:]
+
+    def _get_shard_by_index(self, index: int) -> tuple[str, int]:
+        assert 0 <= index < self.length, f"{index} need between zero and {self.length}"
+        cur = 0
+        for shard, sample_num in self.shard_sample_range.items():
+            if cur <= index < cur + sample_num:
+                return shard, index - cur
+            cur += sample_num
+
+        raise ValueError(f"can not get index {index} in data shard ")
 
 
-def _per_shard_preprocess_data(config: DatasetConfig, shard_id: int):
-    dataset = load_dataset(
-        path=config.name, cache_dir=config.cache_dir, split=config.split
-    )
-    shard_ds = dataset.shard(num_shards=config.shard, index=shard_id)
+ds = ShardIndexDataset("gpt2/data", seq_len=1024)
 
-    tokenizer = tiktoken.get_encoding(config.tokenizer_model)
-    EOT_TOKEN = tokenizer.eot_token
-    print(f"Shard {shard_id}: {len(shard_ds):,} samples")
-
-    all_tokens = []
-    for sample in tqdm(
-        shard_ds, position=shard_id, desc=f"Shard {shard_id}", leave=True
-    ):
-        # 每个样本后面加<|endoftext|>
-        tokens = tokenizer.encode(sample["text"]) + [EOT_TOKEN]
-        all_tokens.extend(tokens)
-
-    os.makedirs(config.data_dir, exist_ok=True)
-    # 保存
-    shard_path = f"{config.data_dir}/shard_{shard_id:04d}.npy"
-    np.save(shard_path, np.array(all_tokens, dtype=np.int32))
-
-    return {
-        "shard_id": shard_id,
-        "num_tokens": len(all_tokens),
-        "num_samples": len(shard_ds),
-    }
-
-
-def preprocess_data(config: DatasetConfig):
-    shard_infos = [(config, i) for i in range(config.shard)]
-    with Pool(processes=config.shard) as pool:
-        results = pool.starmap(_per_shard_preprocess_data, shard_infos)
-
-    # 汇总
-    total_tokens = sum(r["num_tokens"] for r in results)
-    print(f"\n完成！总 tokens: {total_tokens:,}")
-    for r in sorted(results, key=lambda x: x["shard_id"]):
-        print(f"  Shard {r['shard_id']}: {r['num_tokens']:,} tokens")
-
-
-if __name__ == "__main__":
-    preprocess_data(config=DatasetConfig())
+loader = DataLoader(ds, batch_size=16, shuffle=False, drop_last=True)
+print(next(iter(loader)))
