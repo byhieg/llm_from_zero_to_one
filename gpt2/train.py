@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import random
+import time
 from typing import Iterator
 from torch import cuda
 from torch.utils.data import DataLoader, Sampler
@@ -98,13 +99,34 @@ if __name__ == "__main__":
 
     model = GPT2(GPTConfig())
     model = model.to(device)
+    # 简单训练优化器，用于输出指标
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     for epoch in range(train_config.epoch_num):
         # 每个 epoch 启动前设置随机起始索引
         sampler.set_epoch(epoch)
         for step, batch in enumerate(loader):
+            start_time = time.time()
             x = batch[0].to(device)
             y = batch[1].to(device)
+
             logits, loss = model(x, y)
-            print(f"loss:{loss}")
+            optimizer.zero_grad()
+            loss.backward()
+            # 计算梯度范数（在 backward 之后，step 之前）
+            grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_norm += float(p.grad.data.norm(2).item()) ** 2
+            grad_norm = grad_norm**0.5
+
+            optimizer.step()
+
+            elapsed = time.time() - start_time
+            tokens = train_config.batch_size * train_config.seq_len
+            throughput = int(tokens / elapsed) if elapsed > 0 else 0
+            print(
+                f"step: {step} | loss: {loss.item():.2f} | grad_norm: {grad_norm:.2f} | "
+                f"tokens: {tokens} | time: {elapsed:.2f}s | throughput: {throughput} tokens/s"
+            )
             if step == 2:
                 break

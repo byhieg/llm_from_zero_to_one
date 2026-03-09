@@ -238,9 +238,6 @@ class GPT2(nn.Module):
         logits_flat: Float[Tensor, "B*T vocab_size"] = logits.view(
             -1, self.config.vocab_size
         )
-        y_flat: Float[Tensor, "B*T"] = y.view(-1)
+        y_flat: torch.LongTensor = y.view(-1).long()  # 确保标签是 Long 类型
         loss = nn.functional.cross_entropy(logits_flat, y_flat)
         return logits, loss
-
-
-    
