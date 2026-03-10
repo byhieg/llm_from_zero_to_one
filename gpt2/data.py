@@ -22,13 +22,14 @@ class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         }
         self.shard_data = {}
 
-    def __len__(
-        self,
-    ) -> int:
-        return self.length
+    def __len__(self) -> int:
+        # 返回样本数，不是 token 数
+        return self.length // self.seq_len
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        result = self._get_shard_by_index(idx)  # type: ignore[return-value]
+        # 根据样本索引计算 token 起始位置（无重叠切分）
+        token_start = idx * self.seq_len
+        result = self._get_shard_by_index(token_start)  # type: ignore[return-value]
         shard_id = str(result[0])
         local_index = int(result[1])
         # Ensure shard_id is a string for dict key access and compatibility with dynamic typing
@@ -84,4 +85,3 @@ class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             cur += sample_num
 
         raise ValueError(f"can not get index {index} in data shard ")
-

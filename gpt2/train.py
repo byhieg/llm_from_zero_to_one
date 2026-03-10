@@ -1,11 +1,9 @@
 from dataclasses import dataclass, field
 import torch
 from torch.cuda.amp import autocast, GradScaler
-import random
 import time
-from typing import Iterator, Literal
-from torch import cuda
-from torch.utils.data import DataLoader, Sampler
+from typing import Literal
+from torch.utils.data import DataLoader
 from gpt2.data import ShardIndexDataset
 from gpt2.model import GPTConfig, GPT2
 import swanlab
@@ -17,68 +15,8 @@ class TrainConfig:
     seq_len: int = 1024
     epoch_num: int = 1
     data_path: str = "/root/autodl-tmp/data"
-    use_amp: bool = True  # 是否使用混合精度训练
-    amp_dtype: Literal["fp16", "bf16"] = "bf16"  # 混合精度类型
-
-
-class RandomStartSampler(Sampler):
-    """
-    自定义采样器：每个 epoch 开始时随机指定一个 start index
-    然后从该位置开始顺序采样
-
-    适用于语言模型训练，增加数据随机性
-    """
-
-    def __init__(self, data_source, batch_size: int, drop_last: bool = True):
-        self.data_source = data_source
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.num_samples = len(data_source)
-
-        # 计算每个 epoch 可以产生的样本数
-        if self.drop_last:
-            self.num_batches = self.num_samples // self.batch_size
-        else:
-            self.num_batches = (
-                self.num_samples + self.batch_size - 1
-            ) // self.batch_size
-
-        # 随机起始索引（会在每个 epoch 重新生成）
-        self.start_index = 0
-
-    def set_epoch(self, epoch: int):
-        """
-        设置当前 epoch，并随机生成起始索引
-        这个方法会在每个 epoch 开始时被调用
-        """
-        # 随机选择一个起始位置（0 到 num_samples - 1）
-        self.start_index = random.randint(0, self.num_samples - 1)
-        print(f"  [Sampler] Epoch {epoch}: 随机起始索引 = {self.start_index}")
-
-    def __iter__(self) -> Iterator[int]:
-        """
-        生成索引迭代器
-        从 start_index 开始，循环遍历整个数据集
-        """
-        indices = list(range(self.num_samples))
-
-        # 从 start_index 开始重新排列
-        # 例如：start_index=500, num_samples=1000
-        # 结果：[500, 501, ..., 999, 0, 1, ..., 499]
-        rotated_indices = indices[self.start_index :] + indices[: self.start_index]
-
-        # 如果 drop_last，只保留完整的 batch
-        if self.drop_last:
-            total_samples = self.num_batches * self.batch_size
-            rotated_indices = rotated_indices[:total_samples]
-
-        yield from rotated_indices
-
-    def __len__(self) -> int:
-        """返回样本总数"""
-        if self.drop_last:
-            return self.num_batches * self.batch_size
-        return self.num_samples
+    use_amp: bool = True
+    amp_dtype: Literal["fp16", "bf16"] = "bf16"
 
 
 if __name__ == "__main__":
@@ -118,16 +56,10 @@ if __name__ == "__main__":
     )
 
     ds = ShardIndexDataset(train_config.data_path, seq_len=train_config.seq_len)
-    # 使用自定义 RandomStartSampler 替代 shuffle，以实现每个 epoch 的随机起始
-    sampler = RandomStartSampler(
-        data_source=ds,
-        batch_size=train_config.batch_size,
-        drop_last=True,
-    )
     loader = DataLoader(
         ds,
         batch_size=train_config.batch_size,
-        sampler=sampler,
+        shuffle=True,
         drop_last=True,
         num_workers=4,
     )
@@ -136,13 +68,10 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     model = torch.compile(model)
     model = model.to(device)
-    # 简单训练优化器，用于输出指标
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     global_step = 0
     for epoch in range(train_config.epoch_num):
-        # 每个 epoch 启动前设置随机起始索引
-        sampler.set_epoch(epoch)
         for step, batch in enumerate(loader):
             start_time = time.time()
             x = batch[0].to(device)
