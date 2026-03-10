@@ -11,11 +11,10 @@ from gpt2.model import GPTConfig, GPT2
 
 @dataclass
 class TrainConfig:
-    total_tokens: int = 320 * 1024
-    batch_tokens: int = 16 * 1024
-    batch_size: int = 1
+    batch_size: int = 8
     seq_len: int = 1024
     epoch_num: int = 1
+    data_path:str = "/root/autodl-tmp/data"
 
 
 class RandomStartSampler(Sampler):
@@ -82,7 +81,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     train_config = TrainConfig()
-    ds = ShardIndexDataset("gpt2/data", seq_len=train_config.seq_len)
+    ds = ShardIndexDataset(train_config.data_path, seq_len=train_config.seq_len)
     # 使用自定义 RandomStartSampler 替代 shuffle，以实现每个 epoch 的随机起始
     sampler = RandomStartSampler(
         data_source=ds,
@@ -94,10 +93,12 @@ if __name__ == "__main__":
         batch_size=train_config.batch_size,
         sampler=sampler,
         drop_last=True,
-        num_workers=1,
+        num_workers=4,
     )
 
     model = GPT2(GPTConfig())
+    torch.set_float32_matmul_precision('high')
+    model = torch.compile(model)
     model = model.to(device)
     # 简单训练优化器，用于输出指标
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -128,5 +129,4 @@ if __name__ == "__main__":
                 f"step: {step} | loss: {loss.item():.2f} | grad_norm: {grad_norm:.2f} | "
                 f"tokens: {tokens} | time: {elapsed:.2f}s | throughput: {throughput} tokens/s"
             )
-            if step == 2:
-                break
+            

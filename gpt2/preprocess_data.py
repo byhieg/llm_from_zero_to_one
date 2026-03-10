@@ -8,22 +8,27 @@ from tqdm import tqdm
 import json
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-current_dir = os.path.dirname(os.path.abspath(__file__))
+# current_dir = os.path.dirname(os.path.abspath(__file__))
 
-
+current_dir = '/root/autodl-tmp'
 @dataclass
 class DatasetConfig:
     name: str = "roneneldan/TinyStories"
     shard: int = 8
     tokenizer_model: str = "gpt2"
     split: str = "train"
-    cache_dir: str = f"{current_dir}/cache"
-    data_dir: str = f"{current_dir}/data"
+    current_dir: str = os.path.dirname(os.path.abspath(__file__))
+    
+    def get_cache_dir(self):
+        return  f"{current_dir}/cache"
+    
+    def get_data_dir(self):
+        return f"{current_dir}/data"
 
 
 def _per_shard_preprocess_data(config: DatasetConfig, shard_id: int):
     dataset = load_dataset(
-        path=config.name, cache_dir=config.cache_dir, split=config.split
+        path=config.name, cache_dir=config.get_cache_dir(), split=config.split
     )
     shard_ds = dataset.shard(num_shards=config.shard, index=shard_id)
 
@@ -39,9 +44,9 @@ def _per_shard_preprocess_data(config: DatasetConfig, shard_id: int):
         tokens = tokenizer.encode(sample["text"]) + [EOT_TOKEN]
         all_tokens.extend(tokens)
 
-    os.makedirs(config.data_dir, exist_ok=True)
+    os.makedirs(config.get_data_dir(), exist_ok=True)
     # 保存
-    shard_path = f"{config.data_dir}/shard_{shard_id:04d}.npy"
+    shard_path = f"{config.get_data_dir()}/shard_{shard_id:04d}.npy"
     np.save(shard_path, np.array(all_tokens, dtype=np.int32))
 
     return {
