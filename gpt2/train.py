@@ -72,6 +72,10 @@ if __name__ == "__main__":
 
     global_step = 0
     for epoch in range(train_config.epoch_num):
+        total_steps = len(loader)
+        print(f"Epoch {epoch}: Total steps = {total_steps}")
+        swanlab.log({"train/total_steps": total_steps, "train/epoch": epoch})
+
         for step, batch in enumerate(loader):
             start_time = time.time()
             x = batch[0].to(device)
@@ -117,23 +121,22 @@ if __name__ == "__main__":
                 grad_norm = grad_norm**0.5
                 optimizer.step()
 
-            elapsed = time.time() - start_time
+            elapsed_ms = (time.time() - start_time) * 1000
             tokens = train_config.batch_size * train_config.seq_len
-            throughput = int(tokens / elapsed) if elapsed > 0 else 0
+            throughput = int(tokens / (elapsed_ms / 1000)) if elapsed_ms > 0 else 0
 
-            # 打印指标
             print(
                 f"epoch: {epoch} | step: {step} | loss: {loss.item():.2f} | "
                 f"grad_norm: {grad_norm:.2f} | tokens: {tokens} | "
-                f"time: {elapsed:.2f}s | throughput: {throughput} tokens/s"
+                f"time: {elapsed_ms:.2f}ms | throughput: {throughput} tokens/s"
             )
 
-            # 记录指标到 SwanLab
             swanlab.log(
                 {
                     "train/loss": loss.item(),
                     "train/grad_norm": grad_norm,
                     "train/throughput": throughput,
+                    "train/time_ms": elapsed_ms,
                     "train/epoch": epoch,
                     "train/step": step,
                     "train/global_step": global_step,
