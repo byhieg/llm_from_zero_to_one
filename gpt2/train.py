@@ -20,7 +20,6 @@ class TrainConfig:
     amp_dtype: Literal["fp16", "bf16"] = "bf16"
     learning_rate: float = 3e-4
     warmup_steps: int = 10
-    max_steps: int = 1000
     grad_clip: float = 1.0
 
 
@@ -65,7 +64,6 @@ if __name__ == "__main__":
             "amp_dtype": train_config.amp_dtype,
             "learning_rate": train_config.learning_rate,
             "warmup_steps": train_config.warmup_steps,
-            "max_steps": train_config.max_steps,
             "grad_clip": train_config.grad_clip,
         },
     )
@@ -77,6 +75,11 @@ if __name__ == "__main__":
         shuffle=True,
         drop_last=True,
         num_workers=4,
+    )
+
+    max_steps = train_config.epoch_num * len(loader)
+    print(
+        f"Total training steps: {max_steps} (epochs: {train_config.epoch_num}, steps_per_epoch: {len(loader)})"
     )
 
     model = GPT2(GPTConfig())
@@ -95,7 +98,7 @@ if __name__ == "__main__":
             lr = get_lr(
                 global_step,
                 train_config.warmup_steps,
-                train_config.max_steps,
+                max_steps,
                 train_config.learning_rate,
             )
             for param_group in optimizer.param_groups:
@@ -162,7 +165,4 @@ if __name__ == "__main__":
             )
 
             global_step += 1
-            if step == 2:
-                break
-
     swanlab.finish()
