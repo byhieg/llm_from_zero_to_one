@@ -1,29 +1,33 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import json
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List
+import random
+from torch.utils.data import Dataset
 
 
-class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(self, data_path: str, seq_len: int):
+class ShardIndexDataset(Dataset):
+    def __init__(self, data_path: str, seq_len: int, seed: int = 42):
         super().__init__()
         self.data_path = Path(data_path)
         self.seq_len = seq_len
+        self.seed = seed
         assert self.data_path.exists(), f"{data_path} need exist"
         with Path(self.data_path / "meta.json").open("r", encoding="utf-8") as f:
             self.data_meta: Dict[str, Dict[str, Any]] = json.load(f)
 
         self.length = sum(v["tokens"] for v in self.data_meta.values())
         self.total_shard = int(max(self.data_meta.keys())) + 1
-        self.shard_sample_range: dict[str, int] = {
+        self.shard_sample_range: Dict[str, int] = {
             k: v["tokens"] for k, v in self.data_meta.items()
         }
-        self.shard_data = {}
+        self.shard_data: Dict[str, np.ndarray] = {}
+
+        self.shard_order: List[str] = list(self.shard_sample_range.keys())
+        self.epoch = 0
 
     def __len__(self) -> int:
-        # 返回样本数，不是 token 数
         return self.length // self.seq_len
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -53,11 +57,8 @@ class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 local_index : local_index + needed_tokens
             ]
         else:
-            # 跨 shard 读取
-            if int(shard_id) == self.total_shard - 1:
-                next_shard = "0"
-            else:
-                next_shard = str(int(shard_id) + 1)
+            current_idx = self.shard_order.index(shard_id)
+            next_shard = self.shard_order[(current_idx + 1) % self.total_shard]
 
             if next_shard not in self.shard_data:
                 shard_data = np.load(
@@ -76,10 +77,18 @@ class ShardIndexDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         tokens = torch.from_numpy(tokens.astype(self.data_meta[shard_id]["type"]))
         return tokens[:-1], tokens[1:]
 
+    def shuffle_shard(self, epoch: int) -> None:
+        """打乱 shard 顺序。DDP 环境下使用相同 seed+epoch 确保所有进程一致。"""
+        self.epoch = epoch
+        rng = random.Random(self.seed + epoch)
+        self.shard_order = list(self.shard_sample_range.keys())
+        rng.shuffle(self.shard_order)
+
     def _get_shard_by_index(self, index: int) -> tuple[str, int]:
         assert 0 <= index < self.length, f"{index} need between zero and {self.length}"
         cur = 0
-        for shard, sample_num in self.shard_sample_range.items():
+        for shard in self.shard_order:
+            sample_num = self.shard_sample_range[shard]
             if cur <= index < cur + sample_num:
                 return shard, index - cur
             cur += sample_num

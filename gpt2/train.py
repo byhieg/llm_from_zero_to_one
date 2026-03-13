@@ -72,7 +72,7 @@ if __name__ == "__main__":
     loader = DataLoader(
         ds,
         batch_size=train_config.batch_size,
-        shuffle=True,
+        shuffle=False,
         drop_last=True,
         num_workers=4,
     )
@@ -90,6 +90,7 @@ if __name__ == "__main__":
 
     global_step = 0
     for epoch in range(train_config.epoch_num):
+        ds.shuffle_shard(epoch)
         total_steps = len(loader)
         print(f"Epoch {epoch}: Total steps = {total_steps}")
         swanlab.log({"train/total_steps": total_steps, "train/epoch": epoch})
@@ -107,39 +108,30 @@ if __name__ == "__main__":
             start_time = time.time()
             x = batch[0].to(device)
             y = batch[1].to(device)
+            optimizer.zero_grad()
 
             if train_config.use_amp and amp_dtype is not None:
                 with autocast(dtype=amp_dtype):
                     logits, loss = model(x, y)
 
-                optimizer.zero_grad()
-
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), train_config.grad_clip
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), train_config.grad_clip
-                    )
-                    optimizer.step()
             else:
                 logits, loss = model(x, y)
-                optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), train_config.grad_clip
-                )
-                optimizer.step()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), train_config.grad_clip
             )
+
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
             elapsed_ms = (time.time() - start_time) * 1000
             tokens = train_config.batch_size * train_config.seq_len
