@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from regex import T
 import torch
 from torch.cuda.amp import autocast, GradScaler
 import time
@@ -75,6 +76,7 @@ if __name__ == "__main__":
         shuffle=False,
         drop_last=True,
         num_workers=4,
+        pin_memory=True
     )
 
     max_steps = train_config.epoch_num * len(loader)
@@ -106,8 +108,9 @@ if __name__ == "__main__":
                 param_group["lr"] = lr
 
             start_time = time.time()
-            x = batch[0].to(device)
-            y = batch[1].to(device)
+            batch:torch.Tensor
+            x = batch[0].to(device,non_blocking=True)
+            y = batch[1].to(device,non_blocking=True)
             optimizer.zero_grad()
 
             if train_config.use_amp and amp_dtype is not None:

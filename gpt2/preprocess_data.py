@@ -6,30 +6,45 @@ import tiktoken
 from multiprocessing import Pool
 from tqdm import tqdm
 import json
+from modelscope import MsDataset
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 
-current_dir = '/root/autodl-tmp'
+current_dir = "/root/autodl-tmp"
+
+
 @dataclass
 class DatasetConfig:
-    name: str = "roneneldan/TinyStories"
-    shard: int = 8
+    name: str = "AI-ModelScope/fineweb-edu"
+    subset_name: str = None
+    shard: int = 100
     tokenizer_model: str = "gpt2"
-    split: str = "train"
+    split: str = "sample-10BT"
+    use_model_scope = True
+    data_files = None
     current_dir: str = os.path.dirname(os.path.abspath(__file__))
-    
+
     def get_cache_dir(self):
-        return  f"{current_dir}/cache"
-    
+        return f"{current_dir}/cache"
+
     def get_data_dir(self):
         return f"{current_dir}/data"
 
 
 def _per_shard_preprocess_data(config: DatasetConfig, shard_id: int):
-    dataset = load_dataset(
-        path=config.name, cache_dir=config.get_cache_dir(), split=config.split
-    )
+    if not config.use_model_scope:
+        dataset = load_dataset(
+            path=config.name, cache_dir=config.get_cache_dir(), split=config.split
+        )
+    else:
+        dataset = MsDataset.load(
+            dataset_name=config.name,
+            cache_dir=config.get_cache_dir(),
+            split=config.split,
+            subset_name=config.subset_name,
+        )
+
     shard_ds = dataset.shard(num_shards=config.shard, index=shard_id)
 
     tokenizer = tiktoken.get_encoding(config.tokenizer_model)

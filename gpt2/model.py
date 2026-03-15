@@ -96,27 +96,13 @@ class CausalSelfAttention(nn.Module):
         k: Float[Tensor, "B T n_embd"]
         v: Float[Tensor, "B T n_embd"]
         q, k, v = qkv.split(self.config.n_embd, dim=-1)
-        q: Float[Tensor, "B n_head T head_dim"] = q.view(
-            B, T, self.config.n_head, head_dim
-        ).transpose(1, 2)
-        k: Float[Tensor, "B n_head T head_dim"] = k.view(
-            B, T, self.config.n_head, head_dim
-        ).transpose(1, 2)
-        v: Float[Tensor, "B n_head T head_dim"] = v.view(
-            B, T, self.config.n_head, head_dim
-        ).transpose(1, 2)
+        q = q.view(B, T, self.config.n_head, head_dim)
+        k = k.view(B, T, self.config.n_head, head_dim)
+        v = v.view(B, T, self.config.n_head, head_dim)
+        q = torch.einsum("bthd->bhtd", q)
+        k = torch.einsum("bthd->bhtd", k)
+        v = torch.einsum("bthd->bhtd", v)
 
-        # score:Float[Tensor, "B n_head T T"] = q @ k.transpose(2,3) / (head_dim ** 0.5)
-        # mask = torch.triu(torch.ones(T,T),diagonal=1).bool()
-        # # mask:
-        # # [[False,  True,  True,  True],
-        # #  [False, False,  True,  True],
-        # #  [False, False, False,  True],
-        # #  [False, False, False, False]]
-        # score = torch.masked_fill(score,mask,float('-inf')) # 掩码，将上三角的分数都设置为最小，这样softmax之后就是0
-        # attn_weights:Float[Tensor,"B n_head T T"]  = nn.functional.softmax(score,dim=-1)
-
-        # output:Float[Tensor, "B n_head T head_dim"] =  attn_weights @ v
         output = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
         output: Float[Tensor, "B T n_embd"] = (
             output.transpose(1, 2).contiguous().view(B, T, n_embd)
