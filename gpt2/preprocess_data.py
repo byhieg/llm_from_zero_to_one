@@ -3,96 +3,107 @@ from datasets import load_dataset
 import os
 import numpy as np
 import tiktoken
-from multiprocessing import Pool
 from tqdm import tqdm
 import json
-from modelscope import MsDataset
+from glob import glob
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# current_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 current_dir = "/root/autodl-tmp"
 
 
 @dataclass
 class DatasetConfig:
-    name: str = "AI-ModelScope/fineweb-edu"
-    subset_name: str = None
-    shard: int = 100
+    name: str = "/root/autodl-tmp/fineweb-edu"
+    tokens_per_shard: int = 100 * 1000 * 1000
     tokenizer_model: str = "gpt2"
-    split: str = "sample-10BT"
-    use_model_scope = True
-    data_files = None
-    current_dir: str = os.path.dirname(os.path.abspath(__file__))
-
-    def get_cache_dir(self):
-        return f"{current_dir}/cache"
+    max_files: int = 0
 
     def get_data_dir(self):
         return f"{current_dir}/data"
 
 
-def _per_shard_preprocess_data(config: DatasetConfig, shard_id: int):
-    if not config.use_model_scope:
-        dataset = load_dataset(
-            path=config.name, cache_dir=config.get_cache_dir(), split=config.split
-        )
-    else:
-        dataset = MsDataset.load(
-            dataset_name=config.name,
-            cache_dir=config.get_cache_dir(),
-            split=config.split,
-            subset_name=config.subset_name,
-        )
+def preprocess_data(config: DatasetConfig):
+    all_files = sorted(glob(f"{config.name}/*.parquet"))
 
-    shard_ds = dataset.shard(num_shards=config.shard, index=shard_id)
+    if config.max_files > 0:
+        all_files = all_files[: config.max_files]
 
-    tokenizer = tiktoken.get_encoding(config.tokenizer_model)
-    EOT_TOKEN = tokenizer.eot_token
-    print(f"Shard {shard_id}: {len(shard_ds):,} samples")
+    if not all_files:
+        raise FileNotFoundError(f"未找到 parquet 文件: {config.name}/*.parquet")
 
-    all_tokens = []
-    for sample in tqdm(
-        shard_ds, position=shard_id, desc=f"Shard {shard_id}", leave=True
-    ):
-        # 每个样本后面加<|endoftext|>
-        tokens = tokenizer.encode(sample["text"]) + [EOT_TOKEN]
-        all_tokens.extend(tokens)
+    print(f"📁 找到 {len(all_files)} 个 parquet 文件")
+    print(f"📦 每个 shard 包含 {config.tokens_per_shard:,} tokens")
 
     os.makedirs(config.get_data_dir(), exist_ok=True)
-    # 保存
-    shard_path = f"{config.get_data_dir()}/shard_{shard_id:04d}.npy"
-    np.save(shard_path, np.array(all_tokens, dtype=np.int32))
 
-    return {
-        "shard_id": shard_id,
-        "num_tokens": len(all_tokens),
-        "num_samples": len(shard_ds),
-        "file_path": f"shard_{shard_id:04d}.npy",
-    }
+    tokenizer = tiktoken.get_encoding(config.tokenizer_model)
+    allowed_special = tokenizer.special_tokens_set
 
+    shard_id = 0
+    current_tokens = []
+    total_tokens = 0
+    total_samples = 0
+    shard_infos = {}
 
-def preprocess_data(config: DatasetConfig):
-    shard_infos = [(config, i) for i in range(config.shard)]
-    with Pool(processes=config.shard) as pool:
-        results = pool.starmap(_per_shard_preprocess_data, shard_infos)
+    for file_path in tqdm(all_files, desc="处理文件"):
+        dataset = load_dataset(
+            "parquet",
+            data_files=file_path,
+            split="train",
+        )
 
-    # 汇总
-    total_tokens = sum(r["num_tokens"] for r in results)
-    print(f"\n完成！总 tokens: {total_tokens:,}")
-    meta = {}
-    for r in sorted(results, key=lambda x: x["shard_id"]):
-        print(f"  Shard {r['shard_id']}: {r['num_tokens']:,} tokens")
-        meta[r["shard_id"]] = {
-            "tokens": r["num_tokens"],
-            "samples": r["num_samples"],
+        for sample in tqdm(
+            dataset, desc=f"Tokenizing {os.path.basename(file_path)}", leave=False
+        ):
+            tokens = tokenizer.encode(sample["text"], allowed_special=allowed_special)
+            current_tokens.extend(tokens)
+            total_samples += 1
+
+            while len(current_tokens) >= config.tokens_per_shard:
+                shard_tokens = current_tokens[: config.tokens_per_shard]
+                current_tokens = current_tokens[config.tokens_per_shard :]
+
+                shard_path = f"{config.get_data_dir()}/shard_{shard_id:04d}.npy"
+                np.save(shard_path, np.array(shard_tokens, dtype=np.int32))
+
+                shard_infos[shard_id] = {
+                    "tokens": len(shard_tokens),
+                    "type": "int16",
+                    "file_path": f"shard_{shard_id:04d}.npy",
+                }
+
+                print(
+                    f"✅ Shard {shard_id}: {len(shard_tokens):,} tokens → {shard_path}"
+                )
+                total_tokens += len(shard_tokens)
+                shard_id += 1
+
+    if current_tokens:
+        shard_path = f"{config.get_data_dir()}/shard_{shard_id:04d}.npy"
+        np.save(shard_path, np.array(current_tokens, dtype=np.int32))
+
+        shard_infos[shard_id] = {
+            "tokens": len(current_tokens),
             "type": "int32",
-            "file_path": r["file_path"],
+            "file_path": f"shard_{shard_id:04d}.npy",
         }
 
-    with open(f"{config.data_dir}/meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        print(f"✅ Shard {shard_id}: {len(current_tokens):,} tokens → {shard_path}")
+        total_tokens += len(current_tokens)
+
+    with open(f"{config.get_data_dir()}/meta.json", "w", encoding="utf-8") as f:
+        json.dump(shard_infos, f, indent=2, ensure_ascii=False)
+
+    print(f"\n🎉 完成！")
+    print(f"   📊 总样本: {total_samples:,}")
+    print(f"   🔢 总 tokens: {total_tokens:,}")
+    print(f"   📦 总 shards: {len(shard_infos)}")
+    print(f"   📝 meta.json 已保存至 {config.get_data_dir()}/meta.json")
 
 
 if __name__ == "__main__":
+    os.makedirs(f"{current_dir}/data", exist_ok=True)
     preprocess_data(config=DatasetConfig())
