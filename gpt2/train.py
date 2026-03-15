@@ -14,7 +14,7 @@ import swanlab
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 64
+    batch_size: int = 16
     seq_len: int = 1024
     epoch_num: int = 1
     data_path: str = "/root/autodl-tmp/data"
@@ -259,7 +259,7 @@ if __name__ == "__main__":
                 )
                 throughput = int(tokens / (elapsed_ms / 1000)) if elapsed_ms > 0 else 0
 
-                loss_value = accumulated_loss.item() / train_config.accumulation_steps
+                loss_value = accumulated_loss.item()
                 grad_norm_value = (
                     grad_norm.item() if hasattr(grad_norm, "item") else grad_norm
                 )
@@ -302,7 +302,7 @@ if __name__ == "__main__":
                 print(f"{generated_text}")
                 print(f"{'=' * 60}\n")
                 swanlab.log(
-                    {"inference/text": generated_text, "train/global_step": global_step}
+                    {"inference/text": swanlab.Text(generated_text), "train/global_step": global_step}
                 )
 
             if global_step % train_config.save_steps == 0:
