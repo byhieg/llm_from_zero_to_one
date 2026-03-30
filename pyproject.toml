@@ -10,9 +10,9 @@ dependencies = [
     "modelscope[full]>=1.35.0",
     "numpy>=2.2.6",
     "oss2>=2.19.1",
-    "tiktoken>=0.12.0",
     "torch>=2.10.0",
     "tqdm>=4.67.3",
+    "transformers>=5.4.0",
 ]
 
 [tool.ruff]
