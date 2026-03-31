@@ -1,6 +1,5 @@
-def main():
-    print("Hello from llm-from-zero-to-one!")
-
-
+from trainer import run
+from logger import init_logger
 if __name__ == "__main__":
-    main()
+    init_logger("INFO")
+    run()
