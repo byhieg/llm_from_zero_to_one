@@ -135,6 +135,24 @@ def test_model_factory():
     # 使用 kwargs
     model2 = create_model("gpt2", n_layer=2, n_head=4, n_embd=128, vocab_size=1000, block_size=128)
     assert isinstance(model2, GPT2)
+    
+    # 混合使用（kwargs 覆盖 config_dict）
+    model3 = create_model(
+        "gpt2",
+        config_dict={"n_layer": 6, "n_head": 8},
+        n_layer=2  # 覆盖
+    )
+    assert model3.config.n_layer == 2
+    assert model3.config.n_head == 8
+
+
+def test_unregistered_model_error():
+    """测试未注册模型无法创建"""
+    from trainer.model_factory import create_model
+    
+    # 尝试创建未注册的模型
+    with pytest.raises(ValueError, match="Unknown config 'nonexistent'"):
+        create_model("nonexistent")
 
 
 def test_custom_model_registration():

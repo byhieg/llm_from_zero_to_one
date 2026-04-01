@@ -13,17 +13,30 @@ def create_model(
     """
     创建模型实例
     
+    所有模型必须先在代码中通过 @register_model 和 @register_config 装饰器注册。
+    
     Args:
-        model_name: 模型名称（如 "gpt2"）
-        config_dict: 配置字典
-        **kwargs: 其他参数（覆盖 config_dict）
+        model_name: 已注册的模型名称（如 "gpt2"）
+        config_dict: 配置字典（可选）
+        **kwargs: 配置参数（覆盖 config_dict）
         
     Returns:
         模型实例
         
     Example:
-        >>> model = create_model("gpt2", {"n_layer": 12, "n_head": 12})
+        >>> # 先在代码中注册模型
+        >>> @register_config("gpt2")
+        >>> class GPT2Config(BaseModelConfig):
+        >>>     ...
+        >>> 
+        >>> @register_model("gpt2")
+        >>> class GPT2(BaseModel):
+        >>>     ...
+        >>> 
+        >>> # 然后创建模型
         >>> model = create_model("gpt2", n_layer=12, n_head=12)
+        >>> # 或
+        >>> model = create_model("gpt2", {"n_layer": 12, "n_head": 12})
     """
     # 合并配置
     config_data = {**(config_dict or {}), **kwargs}
@@ -40,40 +53,3 @@ def create_model(
     
     return model
 
-
-def create_model_from_yaml(
-    model_name: str,
-    yaml_path: str
-) -> BaseModel:
-    """
-    从 YAML 文件创建模型
-    
-    Args:
-        model_name: 模型名称
-        yaml_path: YAML 文件路径
-        
-    Returns:
-        模型实例
-    """
-    import yaml
-    from pathlib import Path
-    
-    path = Path(yaml_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    
-    with open(path, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
-    
-    # 如果 YAML 中有 model 字段，从中提取
-    if 'model' in data:
-        model_data = data['model']
-        if isinstance(model_data, dict) and 'config' in model_data:
-            config_dict = model_data['config']
-            model_name = model_data.get('name', model_name)
-        else:
-            config_dict = model_data
-    else:
-        config_dict = data
-    
-    return create_model(model_name, config_dict)
