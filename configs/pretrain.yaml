@@ -1,0 +1,21 @@
+# Pretrain 配置文件
+# 训练基础参数
+batch_size: 16
+seq_len: 1024
+epoch_num: 1
+data_path: ""
+learning_rate: 0.0003
+warmup_steps: 10
+grad_clip: 1.0
+accumulation_steps: 4
+log_steps: 10
+save_steps: 1000
+checkpoint_dir: "checkpoints/pretrain"
+resume_from_checkpoint: null
+
+# Pretrain 特有参数
+inference_steps: 500
+inference_tokens: 100
+inference_topk: 100
+inference_temperature: 1.0
+inference_prompt: "The meaning of life is"
