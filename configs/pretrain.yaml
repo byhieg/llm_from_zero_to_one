@@ -1,4 +1,6 @@
 # Pretrain 配置文件
+mode: pretrain
+
 # 训练基础参数
 batch_size: 16
 seq_len: 1024
