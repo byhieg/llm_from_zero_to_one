@@ -1,6 +1,6 @@
 """测试 args.py 的解析功能"""
 import pytest
-from trainer.args import parse_args, register_args, get_args_class, list_modes, TrainingArgs
+from trainer.train_args import parse_args, register_args, get_args_class, list_modes, TrainingArgs
 from dataclasses import dataclass
 
 

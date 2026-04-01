@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """演示 args.py 的功能"""
 
-from trainer.args import parse_args, list_modes, get_args_class
+from trainer.train_args import parse_args, list_modes, get_args_class
 
 print("=" * 60)
 print("args.py 功能演示")
