@@ -115,7 +115,7 @@ def test_gpt2_save_load_checkpoint(tmp_path):
 
 def test_model_factory():
     """测试模型工厂"""
-    from trainer.model_factory import create_model
+    from models.model_factory import create_model
     
     # 使用工厂创建模型
     model = create_model(
@@ -148,7 +148,7 @@ def test_model_factory():
 
 def test_unregistered_model_error():
     """测试未注册模型无法创建"""
-    from trainer.model_factory import create_model
+    from models.model_factory import create_model
     
     # 尝试创建未注册的模型
     with pytest.raises(ValueError, match="Unknown config 'nonexistent'"):

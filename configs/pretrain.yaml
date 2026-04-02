@@ -23,7 +23,7 @@ checkpoint:
   checkpoint_dir: checkpoints/pretrain
   resume_from_checkpoint: null
 data:
-  data_path: ''
+  data_path: 'xxx'
 device: cpu
 inference:
   steps: 500

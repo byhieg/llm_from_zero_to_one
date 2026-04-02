@@ -19,8 +19,8 @@
     >>> from trainer.model_factory import create_model
     >>> model = create_model("gpt2", n_layer=12)
 """
-from models.base import BaseModel, BaseModelConfig
-from models.registry import (
+from .base import BaseModel, BaseModelConfig
+from .registry import (
     register_model,
     register_config,
     get_model_class,
@@ -29,6 +29,7 @@ from models.registry import (
     list_configs,
     is_registered,
 )
+from .model_factory import create_model
 
 # 自动导入所有模型，触发注册
 import models.gpt2  # noqa: F401
