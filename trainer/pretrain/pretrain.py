@@ -224,32 +224,25 @@ class PreTrainTrainer:
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
-                window_data_time = 0.0
-                window_compute_time = 0.0
                 window_total_tokens = 0
                 window_effective_tokens = 0
-                window_micro_steps = 0
                 window_start_time = time.perf_counter()
                 epoch_iterator = iter(dataloader)
                 step = 0
                 while True:
-                    data_start_time = time.perf_counter()
                     try:
                         x, y = next(epoch_iterator)
                     except StopIteration:
                         break
-                    window_data_time += time.perf_counter() - data_start_time
                     lr = self._get_lr(
                         step,
                         max_steps,
                     )
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = lr
-                    compute_start_time = time.perf_counter()
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                     window_total_tokens += x.numel()
                     window_effective_tokens += self._count_effective_tokens(y)
-                    window_micro_steps += 1
                     is_accumulation_step = (step + 1) % self.args.training.accumulation_steps != 0
                     if device == torch.device("cuda") and self.args.training.amp:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -261,8 +254,6 @@ class PreTrainTrainer:
                     accumulated_loss += loss.detach()
                     
                     if is_accumulation_step:
-                        self._synchronize_device(device)
-                        window_compute_time += time.perf_counter() - compute_start_time
                         step += 1
                         continue
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -272,7 +263,6 @@ class PreTrainTrainer:
                     optimizer.zero_grad()
                     global_step += 1
                     self._synchronize_device(device)
-                    window_compute_time += time.perf_counter() - compute_start_time
                     
                     if global_step % self.args.training.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - window_start_time) * 1000
@@ -286,17 +276,10 @@ class PreTrainTrainer:
                                 "train/effective_throughput": int(
                                     window_effective_tokens / (elapsed_ms / 1000)
                                 ),
-                                "train/data_time_ms": int(window_data_time * 1000),
-                                "train/compute_time_ms": int(window_compute_time * 1000),
-                                "train/step_time_ms": int(elapsed_ms),
-                                "train/micro_steps": window_micro_steps,
                             }
                         )
-                        window_data_time = 0.0
-                        window_compute_time = 0.0
                         window_total_tokens = 0
                         window_effective_tokens = 0
-                        window_micro_steps = 0
                         window_start_time = time.perf_counter()
 
                     accumulated_loss = torch.tensor(0.0, device=device)
