@@ -3,10 +3,9 @@ mode: pretrain
 model:
   name: gpt2
   config:
-    block_size: 1024
-    vocab_size: 50257
-    n_layer: 12
-    n_head: 12
+    vocab_size: 6400
+    n_layer: 8
+    n_head: 8
     n_embd: 768
 
 training:
@@ -14,10 +13,13 @@ training:
   seq_len: 1024
   epoch_num: 1
   learning_rate: 0.0003
-  warmup_steps: 10
+  warmup_steps: 100
   grad_clip: 1.0
-  accumulation_steps: 4
+  accumulation_steps: 1
   log_steps: 10
+  seed: 42
+  amp: true
+
 
 checkpoint:
   save_steps: 1000
@@ -26,19 +28,30 @@ checkpoint:
 
 data:
   data_strategy: 'padding'
-  data_path: 'roneneldan/TinyStories'
   dataset_config:
-    max_seq: 1024
+    data_path: 'jingyaogong/minimind_dataset'
+    tokenizer_path: 'jingyaogong/minimind-3'
     split: 'train'
+    data_files: ['pretrain_t2t_mini.jsonl']
     col_name: 'text'
     add_bos_id: false
     add_eos_id: true
+  dataloader_config:
+    shuffle: true
+    num_workers: 4
+    pin_memory: false
+    drop_last: false
+    persistent_workers: false
+    seed: 42
 
-device: cpu
+optimizer:
+  name: adamw
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
 
-inference:
-  steps: 500
-  tokens: 100
-  topk: 100
-  temperature: 1.0
-  prompt: The meaning of life is
+swanlab:
+  enabled: false
+  project: llm-pretrain
+  experiment_name: pretrain-padding-example
+  tags: []

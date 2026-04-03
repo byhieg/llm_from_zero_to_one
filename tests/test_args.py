@@ -9,6 +9,8 @@ from trainer.train_args import (
     CheckpointConfig,
     DataConfig,
     InferenceConfig,
+    OptimizerConfig,
+    SwanlabConfig,
     load_args_from_yaml,
     register_args,
     get_args_class,
@@ -79,6 +81,18 @@ inference:
   topk: 200
   temperature: 0.8
   prompt: "Hello world"
+
+optimizer:
+  name: adamw
+  weight_decay: 0.1
+  betas: [0.8, 0.95]
+  eps: 1.0e-6
+
+swanlab:
+  enabled: true
+  project: demo-project
+  experiment_name: exp-1
+  tags: ["demo"]
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(yaml_content)
@@ -101,6 +115,14 @@ inference:
     assert args.inference.topk == 200
     assert args.inference.temperature == 0.8
     assert args.inference.prompt == "Hello world"
+    assert args.optimizer.name == "adamw"
+    assert args.optimizer.weight_decay == 0.1
+    assert tuple(args.optimizer.betas) == (0.8, 0.95)
+    assert args.optimizer.eps == 1.0e-6
+    assert args.swanlab.enabled is True
+    assert args.swanlab.project == "demo-project"
+    assert args.swanlab.experiment_name == "exp-1"
+    assert args.swanlab.tags == ["demo"]
 
 
 def test_to_yaml():
@@ -115,6 +137,16 @@ def test_to_yaml():
     assert loaded.training.batch_size == 64
     assert loaded.training.learning_rate == 0.0001
     assert loaded.training.epoch_num == 5
+
+
+def test_swanlab_config_defaults():
+    args = PretrainArgs()
+
+    assert isinstance(args.optimizer, OptimizerConfig)
+    assert args.optimizer.name == "adamw"
+    assert isinstance(args.swanlab, SwanlabConfig)
+    assert args.swanlab.enabled is False
+    assert args.swanlab.project == "llm-training"
 
 
 def test_to_dict():
@@ -298,7 +330,11 @@ class TestEnvVarSubstitution:
 class TestValidation:
     def test_valid_config(self):
         args = PretrainArgs(
-            data=DataConfig(data_path="/data/train"),
+            data=DataConfig(
+                data_strategy='padding',
+                dataset_config={'data_path': 'roneneldan/TinyStories'},
+                dataloader_config={'num_workers': 0}
+            ),
             training=TrainingConfig(batch_size=32, learning_rate=0.001),
         )
         errors = args.validate()
@@ -306,14 +342,16 @@ class TestValidation:
 
     def test_missing_data_path(self):
         args = PretrainArgs(
-            training=TrainingConfig(epoch_num=10), data=DataConfig(data_path="")
+            training=TrainingConfig(epoch_num=10),
+            data=DataConfig(data_strategy='padding', dataset_config={})
         )
         errors = args.validate()
         assert any("data_path" in e for e in errors)
 
     def test_invalid_batch_size(self):
         args = PretrainArgs(
-            training=TrainingConfig(batch_size=0), data=DataConfig(data_path="/data")
+            training=TrainingConfig(batch_size=0),
+            data=DataConfig(data_strategy='padding', dataset_config={'data_path': '/data'})
         )
         errors = args.validate()
         assert any("batch_size" in e for e in errors)
@@ -321,10 +359,39 @@ class TestValidation:
     def test_invalid_learning_rate(self):
         args = PretrainArgs(
             training=TrainingConfig(learning_rate=-0.001),
-            data=DataConfig(data_path="/data"),
+            data=DataConfig(data_strategy='padding', dataset_config={'data_path': '/data'}),
         )
         errors = args.validate()
         assert any("learning_rate" in e for e in errors)
+
+    def test_invalid_dataloader_num_workers(self):
+        args = PretrainArgs(
+            data=DataConfig(
+                data_strategy='padding',
+                dataset_config={'data_path': '/data'},
+                dataloader_config={'num_workers': -1},
+            )
+        )
+        errors = args.validate()
+        assert any("num_workers" in e for e in errors)
+
+    def test_invalid_optimizer_name(self):
+        args = PretrainArgs()
+        args.optimizer.name = "sgd"
+        errors = args.validate()
+        assert any("optimizer.name" in e for e in errors)
+
+    def test_invalid_weight_decay(self):
+        args = PretrainArgs()
+        args.optimizer.weight_decay = -0.1
+        errors = args.validate()
+        assert any("optimizer.weight_decay" in e for e in errors)
+
+    def test_invalid_optimizer_betas(self):
+        args = PretrainArgs()
+        args.optimizer.betas = [0.9]
+        errors = args.validate()
+        assert any("optimizer.betas" in e for e in errors)
 
     def test_validation_on_load(self):
         yaml_content = """

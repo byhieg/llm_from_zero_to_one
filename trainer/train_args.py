@@ -21,6 +21,8 @@ class TrainingConfig:
     grad_clip: float = 1.0
     accumulation_steps: int = 4
     log_steps: int = 10
+    seed: int = 42
+    amp: bool = False
 
 
 @dataclass
@@ -35,6 +37,7 @@ class DataConfig:
     data_strategy: str = "padding"
     data_path: str = ""
     dataset_config: dict[str, Any] = field(default_factory=dict)
+    dataloader_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -51,6 +54,23 @@ class ModelConfig:
     """模型配置"""
     name: str = "gpt2"  # 模型名称
     config: dict[str, Any] = field(default_factory=dict)  # 模型特定配置
+
+@dataclass
+class OptimizerConfig:
+    """优化器配置"""
+    name: str = "adamw"
+    weight_decay: float = 0.0
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.999])
+    eps: float = 1e-8
+
+
+@dataclass
+class SwanlabConfig:
+    """SwanLab 配置"""
+    enabled: bool = False
+    project: str = "llm-training"
+    experiment_name: str = "pretrain"
+    tags: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +117,8 @@ class TrainingArgs:
                 "DataConfig",
                 "InferenceConfig",
                 "ModelConfig",
+                "OptimizerConfig",
+                "SwanlabConfig",
             ):
                 field_class = eval(field_type_str)
                 if isinstance(value, dict):
@@ -117,8 +139,8 @@ class TrainingArgs:
     def validate(self) -> list[str]:
         errors = []
 
-        if self.training.epoch_num > 0 and not self.data.data_path:
-            errors.append("data.data_path is required when training.epoch_num > 0")
+        if self.training.epoch_num > 0 and not self.data.dataset_config.get('data_path'):
+            errors.append("data.dataset_config.data_path is required when training.epoch_num > 0")
 
         if self.data.data_strategy not in ('padding', 'megatron'):
             errors.append(
@@ -130,6 +152,12 @@ class TrainingArgs:
                 errors.append(
                     "data.dataset_config.total_token is required when using 'megatron' strategy"
                 )
+
+        dataloader_num_workers = self.data.dataloader_config.get("num_workers", 0)
+        if dataloader_num_workers < 0:
+            errors.append(
+                f"data.dataloader_config.num_workers must be non-negative, got {dataloader_num_workers}"
+            )
 
         if self.training.batch_size <= 0:
             errors.append(
@@ -168,6 +196,8 @@ class PretrainArgs(TrainingArgs):
     data: DataConfig = field(default_factory=DataConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    swanlab: SwanlabConfig = field(default_factory=SwanlabConfig)
 
     def validate(self) -> list[str]:
         errors = super().validate()
@@ -187,6 +217,27 @@ class PretrainArgs(TrainingArgs):
             errors.append(
                 f"inference.temperature must be positive, got {self.inference.temperature}"
             )
+
+        # 验证优化器参数
+        if self.optimizer.weight_decay < 0:
+            errors.append(
+                f"optimizer.weight_decay must be non-negative, got {self.optimizer.weight_decay}"
+            )
+        if self.optimizer.name not in ("adamw", "adam"):
+            errors.append(
+                f"optimizer.name must be 'adamw' or 'adam', got '{self.optimizer.name}'"
+            )
+        if len(self.optimizer.betas) != 2:
+            errors.append(
+                f"optimizer.betas must contain exactly 2 values, got {self.optimizer.betas}"
+            )
+
+        # swanlab 配置无需强校验，但若启用则给出提示信息需求
+        if self.swanlab.enabled:
+            if not self.swanlab.project:
+                errors.append("swanlab.project is required when swanlab.enabled is true")
+            if not self.swanlab.experiment_name:
+                errors.append("swanlab.experiment_name is required when swanlab.enabled is true")
 
         return errors
 
@@ -237,21 +288,6 @@ def _substitute_env_vars(value: Any) -> Any:
 
 
 def _resolve_config_path(mode: str, config_path: str | Path | None = None) -> Path:
-    if config_path:
-        path = Path(config_path)
-    else:
-        path = DEFAULT_config_dir / f"{mode}.yaml"
-
-    if not path.exists():
-        if config_path:
-            raise FileNotFoundError(f"Config file not found: {path}")
-        else:
-            raise FileNotFoundError(
-                f"Config file not found: {path}\n"
-                f"Tip: Use --config to specify a config file, or create {path}"
-            )
-
-    return path
     if config_path:
         path = Path(config_path)
     else:
