@@ -6,7 +6,13 @@ import torch.nn as nn
 
 import trainer.pretrain.pretrain as pretrain_module
 from trainer.pretrain.pretrain import PreTrainTrainer
-from trainer.train_args import DataConfig, ModelConfig, OptimizerConfig, PretrainArgs, TrainingConfig
+from trainer.train_args import (
+    DataConfig,
+    ModelConfig,
+    OptimizerConfig,
+    PretrainArgs,
+    TrainingConfig,
+)
 
 
 class DummyDataset(torch.utils.data.Dataset):
@@ -126,6 +132,97 @@ def test_build_optimizer_supports_adam():
 
     assert isinstance(optimizer, torch.optim.Adam)
 
+
+def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
+    calls = []
+
+    class FakeCheckpointManager:
+        def __init__(self, checkpoint_config, model_name):
+            pass
+
+        def get_checkpoint(self):
+            return {
+                "linear.weight": torch.ones((2, 4)),
+                "linear.bias": torch.zeros(2),
+            }, {
+                "step": 7,
+                "optimizer_state_dict": {
+                    "state": {},
+                    "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
+                },
+            }
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+        def load_state_dict(self, state_dict):
+            calls.append(("optimizer.load_state_dict", state_dict))
+
+        def zero_grad(self):
+            pass
+
+    monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
+    monkeypatch.setattr(
+        pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
+    )
+    monkeypatch.setattr(
+        pretrain_module, "create_model", lambda *args, **kwargs: DummyModel()
+    )
+
+    args = PretrainArgs(
+        training=TrainingConfig(epoch_num=0),
+        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+
+    monkeypatch.setattr(trainer, "_init_seed", lambda: None)
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
+    monkeypatch.setattr(
+        trainer, "_init_swanlab", lambda device, dataset, dataloader: None
+    )
+    monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
+    monkeypatch.setattr(
+        trainer,
+        "_maybe_compile_model",
+        lambda model, device: calls.append(("compile", device.type)) or model,
+    )
+
+    original_load_state_dict = DummyModel.load_state_dict
+    original_to = DummyModel.to
+
+    def fake_load_state_dict(self, state_dict, *args, **kwargs):
+        calls.append(("model.load_state_dict", sorted(state_dict.keys())))
+        return original_load_state_dict(self, state_dict, *args, **kwargs)
+
+    def fake_to(self, device, *args, **kwargs):
+        calls.append(("model.to", str(device)))
+        return original_to(self, device, *args, **kwargs)
+
+    monkeypatch.setattr(DummyModel, "load_state_dict", fake_load_state_dict)
+    monkeypatch.setattr(DummyModel, "to", fake_to)
+
+    def fake_build_optimizer(model):
+        calls.append(("build_optimizer", next(model.parameters()).device.type))
+        return FakeOptimizer()
+
+    monkeypatch.setattr(trainer, "_build_optimizer", fake_build_optimizer)
+
+    trainer.run()
+
+    expected_optimizer_state = {
+        "state": {},
+        "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
+    }
+
+    assert calls[0] == ("model.load_state_dict", ["linear.bias", "linear.weight"])
+    assert calls[1][0] == "model.to"
+    assert calls[2] == ("build_optimizer", calls[1][1])
+    assert calls[3] == ("optimizer.load_state_dict", expected_optimizer_state)
+    assert calls[4] == ("compile", calls[1][1])
+
+
 def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):
     calls = {}
 
@@ -235,7 +332,10 @@ def test_init_swanlab_runs_when_enabled(monkeypatch):
     assert calls["init"]["tags"] == ["unit"]
     assert calls["init"]["config"]["training"]["batch_size"] == 2
     assert calls["init"]["config"]["data"]["dataloader_config"]["seed"] == 7
-    assert calls["init"]["config"]["data"]["dataset_config"]["seq_len"] == args.training.seq_len
+    assert (
+        calls["init"]["config"]["data"]["dataset_config"]["seq_len"]
+        == args.training.seq_len
+    )
     assert "swanlab" not in calls["init"]["config"]
     assert calls["init"]["config"]["runtime"]["device"] == "cpu"
     assert calls["log"] == [{"train/epoch": 0}]

@@ -4,6 +4,8 @@ from dataclasses import asdict
 from importlib import import_module
 
 import math
+
+from ..checkpoint_manager import CheckpointManager
 from ..train_args import PretrainArgs
 
 from logger import get_logger
@@ -37,7 +39,117 @@ class PreTrainTrainer:
     def __init__(self, args: PretrainArgs):
         self.args = args
         self._swanlab = None
-        
+        self.checkpoint_manager = CheckpointManager(
+            args.checkpoint, self.args.model.name
+        )
+
+    def run(self) -> None:
+        self._init_seed()
+        model = create_model(self.args.model.name, self._get_model_config())
+        dataset = create_dataset(
+            data_strategy=self.args.data.data_strategy,
+            dataset_config=self._get_dataset_config(),
+        )
+
+        dataloader = self._build_dataloader(dataset)
+        device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else torch.device("mps")
+            if getattr(torch.backends, "mps", None)
+            and torch.backends.mps.is_available()
+            else torch.device("cpu")
+        )
+        steps_per_epoch = len(dataloader) // self.args.training.accumulation_steps
+        max_steps = self.args.training.epoch_num * steps_per_epoch
+        logger.info(model)
+        logger.info(f"数据集大小: {len(dataset)} 样本")
+        logger.info(f"设备: {device}")
+        logger.info(f"dataloader batch 数: {len(dataloader)}")
+        logger.info(
+            f"总训练步数: {max_steps} (epoch_num: {self.args.training.epoch_num}, "
+            f"每个epoch步数: {steps_per_epoch}, 梯度累加步数: {self.args.training.accumulation_steps})"
+        )
+
+        self._init_swanlab(device, dataset, dataloader)
+        model_checkpoint, metadata = self.checkpoint_manager.get_checkpoint()
+        start_step = 0
+        if model_checkpoint:
+            start_step = metadata.get("step", 0)
+            logger.info(f"Loading checkpoint from step {start_step}")
+            model.load_state_dict(model_checkpoint)
+        else:
+            logger.info("No checkpoint found, starting from scratch")
+        model = model.to(device)
+        optimizer = self._build_optimizer(model)
+        if metadata and metadata.get("optimizer_state_dict"):
+            optimizer.load_state_dict(metadata["optimizer_state_dict"])
+        model = self._maybe_compile_model(model, device)
+        logger.info(f"优化器: {type(optimizer).__name__}")
+        global_step = 0
+        accumulated_loss = torch.tensor(0.0, device=device)
+        tokens = (
+            self.args.training.batch_size
+            * self.args.training.seq_len
+            * self.args.training.accumulation_steps
+            * self.args.training.log_steps
+        )
+        try:
+            for epoch in range(self.args.training.epoch_num):
+                model.train()
+                optimizer.zero_grad()
+                logger.info(f"🚀 Epoch {epoch} start to train")
+                self._log_swanlab({"train/epoch": epoch})
+                window_start_time = time.perf_counter()
+                for step, (x, y) in enumerate(dataloader):
+                    lr = self._get_lr(
+                        step,
+                        max_steps,
+                    )
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
+                    x, y = (
+                        x.to(device, non_blocking=True),
+                        y.to(device, non_blocking=True),
+                    )
+                    should_skip_optimizer_step = (
+                        step + 1
+                    ) % self.args.training.accumulation_steps != 0
+                    if device == torch.device("cuda") and self.args.training.amp:
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits, loss = model(x, y)
+                    else:
+                        logits, loss = model(x, y)
+                    loss = loss / self.args.training.accumulation_steps
+                    loss.backward()
+                    accumulated_loss += loss.detach()
+
+                    if should_skip_optimizer_step:
+                        continue
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), self.args.training.grad_clip
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    if global_step % self.args.training.log_steps == 0:
+                        elapsed_ms = (time.perf_counter() - window_start_time) * 1000
+                        self._log_swanlab(
+                            {
+                                "train/step": global_step,
+                                "train/loss": accumulated_loss.item(),
+                                "train/grad_norm": grad_norm.item(),
+                                "train/lr": lr,
+                                "train/throughput": int(tokens / (elapsed_ms / 1000)),
+                            }
+                        )
+                        window_start_time = time.perf_counter()
+
+                    accumulated_loss = torch.tensor(0.0, device=device)
+
+        finally:
+            self._finish_swanlab()
+
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
         model_config.setdefault("block_size", self.args.training.seq_len)
@@ -47,18 +159,6 @@ class PreTrainTrainer:
         dataset_config = dict(self.args.data.dataset_config)
         dataset_config.setdefault("seq_len", self.args.training.seq_len)
         return dataset_config
-
-    def _get_dataloader_seed(self) -> int:
-        return self.args.data.dataloader_config.get("seed", self.args.training.seed)
-
-    def _set_seed(self, seed: int, init_cuda: bool = False) -> None:
-        _set_process_seed(seed, init_cuda=init_cuda)
-
-    def _init_seed(self):
-        seed = self.args.training.seed
-        self._set_seed(seed, init_cuda=True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
     def _build_dataloader(self, dataset):
         dataloader_config = self.args.data.dataloader_config
@@ -100,17 +200,6 @@ class PreTrainTrainer:
             return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
         raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
 
-    def _synchronize_device(self, device: torch.device) -> None:
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elif (
-            device.type == "mps"
-            and hasattr(torch, "mps")
-            and hasattr(torch.mps, "synchronize")
-            and torch.backends.mps.is_available()
-        ):
-            torch.mps.synchronize()
-
     def _maybe_compile_model(
         self, model: torch.nn.Module, device: torch.device
     ) -> torch.nn.Module:
@@ -127,17 +216,6 @@ class PreTrainTrainer:
         except Exception as exc:
             logger.warning(f"torch.compile 在 {device.type} 上不可用，已跳过: {exc}")
             return model
-
-    def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
-        config = asdict(self.args)
-        config.pop("swanlab", None)
-        config["data"]["dataset_config"] = self._get_dataset_config()
-        config["runtime"] = {
-            "dataset_size": len(dataset),
-            "dataloader_batches": len(dataloader),
-            "device": str(device),
-        }
-        return config
 
     def _init_swanlab(self, device: torch.device, dataset, dataloader) -> None:
         if not self.args.swanlab.enabled:
@@ -165,7 +243,18 @@ class PreTrainTrainer:
         if self._swanlab is not None:
             self._swanlab.finish()
             self._swanlab = None
-            
+
+    def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
+        config = asdict(self.args)
+        config.pop("swanlab", None)
+        config["data"]["dataset_config"] = self._get_dataset_config()
+        config["runtime"] = {
+            "dataset_size": len(dataset),
+            "dataloader_batches": len(dataloader),
+            "device": str(device),
+        }
+        return config
+
     def _get_lr(self, step: int, max_steps: int) -> float:
         warmup_steps = self.args.training.warmup_steps
         learning_rate = self.args.training.learning_rate
@@ -173,109 +262,29 @@ class PreTrainTrainer:
             return learning_rate * step / warmup_steps
         if step > max_steps:
             return learning_rate * 0.1
-        # 余弦退火
         decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return learning_rate * coeff
-    
-    
-    def run(self) -> None:
-        logger.info("PretrainTrainer run")
-        self._init_seed()
-        model = create_model(self.args.model.name, self._get_model_config())
-        dataset_config = self._get_dataset_config()
-        dataset = create_dataset(
-            data_strategy=self.args.data.data_strategy, dataset_config=dataset_config
-        )
 
-        dataloader = self._build_dataloader(dataset)
-        device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("mps")
-            if getattr(torch.backends, "mps", None)
+    def _get_dataloader_seed(self) -> int:
+        return self.args.data.dataloader_config.get("seed", self.args.training.seed)
+
+    def _set_seed(self, seed: int, init_cuda: bool = False) -> None:
+        _set_process_seed(seed, init_cuda=init_cuda)
+
+    def _init_seed(self):
+        seed = self.args.training.seed
+        self._set_seed(seed, init_cuda=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def _synchronize_device(self, device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif (
+            device.type == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "synchronize")
             and torch.backends.mps.is_available()
-            else torch.device("cpu")
-        )
-        steps_per_epoch = len(dataloader) // self.args.training.accumulation_steps
-        max_steps = self.args.training.epoch_num * steps_per_epoch
-        logger.info(model)
-        logger.info(f"数据集大小: {len(dataset)} 样本")
-        logger.info(f"设备: {device}")
-        logger.info(f"dataloader batch 数: {len(dataloader)}")
-        logger.info(f"总训练步数: {max_steps} (epoch_num: {self.args.training.epoch_num}, "
-                    f"每个epoch步数: {steps_per_epoch}, 梯度累加步数: {self.args.training.accumulation_steps})")
-        
-        self._init_swanlab(device, dataset, dataloader)
-        model = model.to(device)
-        model = self._maybe_compile_model(model, device)
-        optimizer = self._build_optimizer(model)
-        logger.info(f"优化器: {type(optimizer).__name__}")
-        global_step = 0
-        accumulated_loss = torch.tensor(0.0, device=device)
-        tokens = (
-            self.args.training.batch_size
-            * self.args.training.seq_len
-            * self.args.training.accumulation_steps
-            * self.args.training.log_steps
-        )
-        try:
-            for epoch in range(self.args.training.epoch_num):
-                model.train()
-                optimizer.zero_grad()
-                logger.info(f"🚀 Epoch {epoch} start to train")
-                self._log_swanlab({"train/epoch": epoch})
-                window_start_time = time.perf_counter()
-                epoch_iterator = iter(dataloader)
-                step = 0
-                while True:
-                    try:
-                        x, y = next(epoch_iterator)
-                    except StopIteration:
-                        break
-                    lr = self._get_lr(
-                        step,
-                        max_steps,
-                    )
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = lr
-                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    is_accumulation_step = (step + 1) % self.args.training.accumulation_steps != 0
-                    if device == torch.device("cuda") and self.args.training.amp:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            logits, loss = model(x, y)
-                    else:
-                        logits, loss = model(x, y)
-                    loss = loss / self.args.training.accumulation_steps
-                    loss.backward()
-                    accumulated_loss += loss.detach()
-                    
-                    if is_accumulation_step:
-                        step += 1
-                        continue
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.args.training.grad_clip
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    global_step += 1
-                    self._synchronize_device(device)
-                    
-                    if global_step % self.args.training.log_steps == 0:
-                        elapsed_ms = (time.perf_counter() - window_start_time) * 1000
-                        self._log_swanlab(
-                            {
-                                "train/step": global_step,
-                                "train/loss": accumulated_loss.item(),
-                                "train/grad_norm": grad_norm.item(),
-                                "train/lr": lr,
-                                "train/throughput": int(tokens / (elapsed_ms / 1000)),
-                            }
-                        )
-                        window_start_time = time.perf_counter()
-
-                    accumulated_loss = torch.tensor(0.0, device=device)
-                    step += 1
-                    
-        finally:
-            self._finish_swanlab()
+        ):
+            torch.mps.synchronize()
