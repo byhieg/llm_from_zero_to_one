@@ -18,17 +18,22 @@ training:
   grad_clip: 1.0
   accumulation_steps: 4
   log_steps: 10
+
 checkpoint:
   save_steps: 1000
   checkpoint_dir: checkpoints/pretrain
   resume_from_checkpoint: null
+
 data:
-  data_strategy: 'padding'
-  data_path: 'xxx'
+  data_strategy: 'megatron'
+  data_path: 'train_data/tiny_stories'
   dataset_config:
-    max_seq: 1024
-    split: 'train'
+    seq_len: 1024
+    total_token: 10000000
+    seed: 42
+
 device: cpu
+
 inference:
   steps: 500
   tokens: 100

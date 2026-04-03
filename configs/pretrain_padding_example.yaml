@@ -18,17 +18,24 @@ training:
   grad_clip: 1.0
   accumulation_steps: 4
   log_steps: 10
+
 checkpoint:
   save_steps: 1000
   checkpoint_dir: checkpoints/pretrain
   resume_from_checkpoint: null
+
 data:
   data_strategy: 'padding'
-  data_path: 'xxx'
+  data_path: 'roneneldan/TinyStories'
   dataset_config:
     max_seq: 1024
     split: 'train'
+    col_name: 'text'
+    add_bos_id: false
+    add_eos_id: true
+
 device: cpu
+
 inference:
   steps: 500
   tokens: 100

@@ -32,7 +32,9 @@ class CheckpointConfig:
 
 @dataclass
 class DataConfig:
+    data_strategy: str = "padding"
     data_path: str = ""
+    dataset_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -117,6 +119,17 @@ class TrainingArgs:
 
         if self.training.epoch_num > 0 and not self.data.data_path:
             errors.append("data.data_path is required when training.epoch_num > 0")
+
+        if self.data.data_strategy not in ('padding', 'megatron'):
+            errors.append(
+                f"data.data_strategy must be 'padding' or 'megatron', got '{self.data.data_strategy}'"
+            )
+
+        if self.data.data_strategy == 'megatron':
+            if 'total_token' not in self.data.dataset_config:
+                errors.append(
+                    "data.dataset_config.total_token is required when using 'megatron' strategy"
+                )
 
         if self.training.batch_size <= 0:
             errors.append(
