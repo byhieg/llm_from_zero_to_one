@@ -127,6 +127,40 @@ def test_build_optimizer_supports_adam():
     assert isinstance(optimizer, torch.optim.Adam)
 
 
+def test_count_effective_tokens_ignores_masked_labels():
+    args = PretrainArgs(
+        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+
+    y = torch.tensor([[1, 2, -100], [3, -100, -100]])
+
+    assert trainer._count_effective_tokens(y) == 3
+
+
+def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):
+    calls = {}
+
+    def fake_compile(model):
+        calls["compiled"] = True
+        return model
+
+    monkeypatch.setattr(pretrain_module.torch, "compile", fake_compile, raising=False)
+
+    args = PretrainArgs(
+        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+    model = DummyModel()
+
+    compiled_model = trainer._maybe_compile_model(model, torch.device("mps"))
+
+    assert compiled_model is model
+    assert calls["compiled"] is True
+
+
 def test_get_dataloader_seed_falls_back_to_training_seed():
     args = PretrainArgs(
         training=TrainingConfig(seed=999),

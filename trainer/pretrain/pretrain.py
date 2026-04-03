@@ -100,6 +100,39 @@ class PreTrainTrainer:
             return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
         raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
 
+    def _count_effective_tokens(self, y: torch.Tensor) -> int:
+        if y.numel() == 0:
+            return 0
+        return int((y != -100).sum().item())
+
+    def _synchronize_device(self, device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif (
+            device.type == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "synchronize")
+            and torch.backends.mps.is_available()
+        ):
+            torch.mps.synchronize()
+
+    def _maybe_compile_model(
+        self, model: torch.nn.Module, device: torch.device
+    ) -> torch.nn.Module:
+        if not hasattr(torch, "compile"):
+            return model
+        if device.type not in ("cuda", "mps"):
+            return model
+        try:
+            if device.type == "cuda":
+                torch.set_float32_matmul_precision("high")
+            compiled_model = torch.compile(model)
+            logger.info(f"torch.compile 已启用: {device.type}")
+            return compiled_model
+        except Exception as exc:
+            logger.warning(f"torch.compile 在 {device.type} 上不可用，已跳过: {exc}")
+            return model
+
     def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
         config = asdict(self.args)
         config.pop("swanlab", None)
@@ -179,35 +212,44 @@ class PreTrainTrainer:
                     f"每个epoch步数: {steps_per_epoch}, 梯度累加步数: {self.args.training.accumulation_steps})")
         
         self._init_swanlab(device, dataset, dataloader)
-        if device == torch.device("cuda"):
-            torch.set_float32_matmul_precision("high")
-            model = torch.compile(model)
         model = model.to(device)
+        model = self._maybe_compile_model(model, device)
         optimizer = self._build_optimizer(model)
         logger.info(f"优化器: {type(optimizer).__name__}")
         global_step = 0
-        last_log_time = time.time()
         accumulated_loss = torch.tensor(0.0, device=device)
-        tokens = (
-            self.args.training.batch_size
-            * self.args.training.seq_len
-            * self.args.training.accumulation_steps
-            * self.args.training.log_steps
-        )
         try:
             for epoch in range(self.args.training.epoch_num):
                 model.train()
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
-                for step, (x,y) in enumerate(dataloader):
+                window_data_time = 0.0
+                window_compute_time = 0.0
+                window_total_tokens = 0
+                window_effective_tokens = 0
+                window_micro_steps = 0
+                window_start_time = time.perf_counter()
+                epoch_iterator = iter(dataloader)
+                step = 0
+                while True:
+                    data_start_time = time.perf_counter()
+                    try:
+                        x, y = next(epoch_iterator)
+                    except StopIteration:
+                        break
+                    window_data_time += time.perf_counter() - data_start_time
                     lr = self._get_lr(
                         step,
                         max_steps,
                     )
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = lr
+                    compute_start_time = time.perf_counter()
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    window_total_tokens += x.numel()
+                    window_effective_tokens += self._count_effective_tokens(y)
+                    window_micro_steps += 1
                     is_accumulation_step = (step + 1) % self.args.training.accumulation_steps != 0
                     if device == torch.device("cuda") and self.args.training.amp:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -219,6 +261,9 @@ class PreTrainTrainer:
                     accumulated_loss += loss.detach()
                     
                     if is_accumulation_step:
+                        self._synchronize_device(device)
+                        window_compute_time += time.perf_counter() - compute_start_time
+                        step += 1
                         continue
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), self.args.training.grad_clip
@@ -226,21 +271,36 @@ class PreTrainTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
+                    self._synchronize_device(device)
+                    window_compute_time += time.perf_counter() - compute_start_time
                     
                     if global_step % self.args.training.log_steps == 0:
-                        elapsed_ms = (time.time() - last_log_time) * 1000
+                        elapsed_ms = (time.perf_counter() - window_start_time) * 1000
                         self._log_swanlab(
                             {
                                 "train/step": global_step,
                                 "train/loss": accumulated_loss.item(),
                                 "train/grad_norm": grad_norm.item(),
                                 "train/lr": lr,
-                                "train/throughput": int(tokens / (elapsed_ms / 1000)),
+                                "train/throughput": int(window_total_tokens / (elapsed_ms / 1000)),
+                                "train/effective_throughput": int(
+                                    window_effective_tokens / (elapsed_ms / 1000)
+                                ),
+                                "train/data_time_ms": int(window_data_time * 1000),
+                                "train/compute_time_ms": int(window_compute_time * 1000),
+                                "train/step_time_ms": int(elapsed_ms),
+                                "train/micro_steps": window_micro_steps,
                             }
                         )
-                        last_log_time = time.time()
+                        window_data_time = 0.0
+                        window_compute_time = 0.0
+                        window_total_tokens = 0
+                        window_effective_tokens = 0
+                        window_micro_steps = 0
+                        window_start_time = time.perf_counter()
 
                     accumulated_loss = torch.tensor(0.0, device=device)
+                    step += 1
                     
         finally:
             self._finish_swanlab()
