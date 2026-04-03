@@ -126,19 +126,6 @@ def test_build_optimizer_supports_adam():
 
     assert isinstance(optimizer, torch.optim.Adam)
 
-
-def test_count_effective_tokens_ignores_masked_labels():
-    args = PretrainArgs(
-        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
-        model=ModelConfig(name="gpt2", config={}),
-    )
-    trainer = PreTrainTrainer(args)
-
-    y = torch.tensor([[1, 2, -100], [3, -100, -100]])
-
-    assert trainer._count_effective_tokens(y) == 3
-
-
 def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):
     calls = {}
 

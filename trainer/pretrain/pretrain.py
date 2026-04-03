@@ -100,11 +100,6 @@ class PreTrainTrainer:
             return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
         raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
 
-    def _count_effective_tokens(self, y: torch.Tensor) -> int:
-        if y.numel() == 0:
-            return 0
-        return int((y != -100).sum().item())
-
     def _synchronize_device(self, device: torch.device) -> None:
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -218,14 +213,18 @@ class PreTrainTrainer:
         logger.info(f"优化器: {type(optimizer).__name__}")
         global_step = 0
         accumulated_loss = torch.tensor(0.0, device=device)
+        tokens = (
+            self.args.training.batch_size
+            * self.args.training.seq_len
+            * self.args.training.accumulation_steps
+            * self.args.training.log_steps
+        )
         try:
             for epoch in range(self.args.training.epoch_num):
                 model.train()
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
-                window_total_tokens = 0
-                window_effective_tokens = 0
                 window_start_time = time.perf_counter()
                 epoch_iterator = iter(dataloader)
                 step = 0
@@ -241,8 +240,6 @@ class PreTrainTrainer:
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = lr
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    window_total_tokens += x.numel()
-                    window_effective_tokens += self._count_effective_tokens(y)
                     is_accumulation_step = (step + 1) % self.args.training.accumulation_steps != 0
                     if device == torch.device("cuda") and self.args.training.amp:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -272,14 +269,9 @@ class PreTrainTrainer:
                                 "train/loss": accumulated_loss.item(),
                                 "train/grad_norm": grad_norm.item(),
                                 "train/lr": lr,
-                                "train/throughput": int(window_total_tokens / (elapsed_ms / 1000)),
-                                "train/effective_throughput": int(
-                                    window_effective_tokens / (elapsed_ms / 1000)
-                                ),
+                                "train/throughput": int(tokens / (elapsed_ms / 1000)),
                             }
                         )
-                        window_total_tokens = 0
-                        window_effective_tokens = 0
                         window_start_time = time.perf_counter()
 
                     accumulated_loss = torch.tensor(0.0, device=device)
