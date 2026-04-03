@@ -7,6 +7,7 @@ import torch.nn as nn
 import trainer.pretrain.pretrain as pretrain_module
 from trainer.pretrain.pretrain import PreTrainTrainer
 from trainer.train_args import (
+    CheckpointConfig,
     DataConfig,
     ModelConfig,
     OptimizerConfig,
@@ -27,6 +28,18 @@ class DummyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(4, 2)
+
+
+class TrainStepModel(nn.Module):
+    def __init__(self, processed_batches):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        self.processed_batches = processed_batches
+
+    def forward(self, x, y):
+        self.processed_batches.append(int(x.reshape(-1)[0].item()))
+        loss = self.weight * 0 + x.float().mean() * 0
+        return x, loss
 
 
 def test_get_dataset_config_inherits_training_seq_len():
@@ -221,6 +234,122 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     assert calls[2] == ("build_optimizer", calls[1][1])
     assert calls[3] == ("optimizer.load_state_dict", expected_optimizer_state)
     assert calls[4] == ("compile", calls[1][1])
+
+
+def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
+    processed_batches = []
+
+    class FakeCheckpointManager:
+        def __init__(self, checkpoint_config, model_name):
+            self.saved_checkpoints = []
+
+        def get_checkpoint(self):
+            model = TrainStepModel([])
+            return model.state_dict(), {
+                "global_step": 3,
+                "epoch": 0,
+                "micro_step_in_epoch": 2,
+            }
+
+        def save_checkpoint(self, checkpoint, step, metadata):
+            self.saved_checkpoints.append((step, metadata))
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+        def step(self):
+            pass
+
+        def zero_grad(self):
+            pass
+
+        def state_dict(self):
+            return {"optimizer": "state"}
+
+    dataloader = [
+        (torch.tensor([0]), torch.tensor([0])),
+        (torch.tensor([1]), torch.tensor([1])),
+        (torch.tensor([2]), torch.tensor([2])),
+        (torch.tensor([3]), torch.tensor([3])),
+    ]
+
+    monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
+    monkeypatch.setattr(
+        pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
+    )
+    monkeypatch.setattr(
+        pretrain_module,
+        "create_model",
+        lambda *args, **kwargs: TrainStepModel(processed_batches),
+    )
+
+    args = PretrainArgs(
+        training=TrainingConfig(epoch_num=1, accumulation_steps=1, log_steps=100),
+        checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/test-pretrain"),
+        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+
+    monkeypatch.setattr(trainer, "_init_seed", lambda: None)
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
+    monkeypatch.setattr(
+        trainer, "_init_swanlab", lambda device, dataset, dataloader: None
+    )
+    monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
+    monkeypatch.setattr(trainer, "_maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
+    monkeypatch.setattr(trainer, "_save_checkpoint_if_needed", lambda **kwargs: None)
+
+    trainer.run()
+
+    assert processed_batches == [2, 3]
+
+
+def test_save_training_checkpoint_persists_resume_position(monkeypatch):
+    saved_checkpoints = []
+    trainer = PreTrainTrainer(
+        PretrainArgs(
+            checkpoint=CheckpointConfig(
+                checkpoint_dir="checkpoints/test-pretrain", save_steps=1
+            ),
+            data=DataConfig(
+                data_strategy="padding",
+                dataset_config={"data_path": "demo"},
+            ),
+            model=ModelConfig(name="gpt2", config={}),
+        )
+    )
+    model = DummyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    monkeypatch.setattr(
+        trainer.checkpoint_manager,
+        "save_checkpoint",
+        lambda checkpoint, step, metadata: saved_checkpoints.append(
+            (checkpoint, step, metadata)
+        ),
+    )
+
+    trainer._save_training_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        global_step=6,
+        epoch=0,
+        micro_step_in_epoch=4,
+        dataloader_length=4,
+    )
+
+    checkpoint, step, metadata = saved_checkpoints[0]
+
+    assert step == 6
+    assert checkpoint.keys() == model.state_dict().keys()
+    assert metadata["global_step"] == 6
+    assert metadata["step"] == 6
+    assert metadata["epoch"] == 1
+    assert metadata["micro_step_in_epoch"] == 0
+    assert "optimizer_state_dict" in metadata
 
 
 def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):

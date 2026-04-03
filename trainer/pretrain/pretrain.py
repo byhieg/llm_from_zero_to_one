@@ -73,10 +73,17 @@ class PreTrainTrainer:
 
         self._init_swanlab(device, dataset, dataloader)
         model_checkpoint, metadata = self.checkpoint_manager.get_checkpoint()
-        start_step = 0
+        global_step = 0
+        start_epoch = 0
+        start_micro_step_in_epoch = 0
         if model_checkpoint:
-            start_step = metadata.get("step", 0)
-            logger.info(f"Loading checkpoint from step {start_step}")
+            global_step = metadata.get("global_step", metadata.get("step", 0))
+            start_epoch = metadata.get("epoch", 0)
+            start_micro_step_in_epoch = metadata.get("micro_step_in_epoch", 0)
+            logger.info(
+                f"Loading checkpoint from step {global_step}, "
+                f"epoch {start_epoch}, micro_step {start_micro_step_in_epoch}"
+            )
             model.load_state_dict(model_checkpoint)
         else:
             logger.info("No checkpoint found, starting from scratch")
@@ -86,7 +93,6 @@ class PreTrainTrainer:
             optimizer.load_state_dict(metadata["optimizer_state_dict"])
         model = self._maybe_compile_model(model, device)
         logger.info(f"优化器: {type(optimizer).__name__}")
-        global_step = 0
         accumulated_loss = torch.tensor(0.0, device=device)
         tokens = (
             self.args.training.batch_size
@@ -94,16 +100,23 @@ class PreTrainTrainer:
             * self.args.training.accumulation_steps
             * self.args.training.log_steps
         )
+        did_update = False
         try:
-            for epoch in range(self.args.training.epoch_num):
+            for epoch in range(start_epoch, self.args.training.epoch_num):
                 model.train()
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
                 window_start_time = time.perf_counter()
-                for step, (x, y) in enumerate(dataloader):
+                micro_step_offset = (
+                    start_micro_step_in_epoch if epoch == start_epoch else 0
+                )
+                epoch_iterator = self._build_epoch_iterator(
+                    dataloader, micro_step_offset
+                )
+                for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     lr = self._get_lr(
-                        step,
+                        global_step,
                         max_steps,
                     )
                     for param_group in optimizer.param_groups:
@@ -132,6 +145,15 @@ class PreTrainTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
+                    did_update = True
+                    self._save_checkpoint_if_needed(
+                        model=model,
+                        optimizer=optimizer,
+                        global_step=global_step,
+                        epoch=epoch,
+                        micro_step_in_epoch=step + 1,
+                        dataloader_length=len(dataloader),
+                    )
                     if global_step % self.args.training.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - window_start_time) * 1000
                         self._log_swanlab(
@@ -146,6 +168,16 @@ class PreTrainTrainer:
                         window_start_time = time.perf_counter()
 
                     accumulated_loss = torch.tensor(0.0, device=device)
+                start_micro_step_in_epoch = 0
+            if did_update:
+                self._save_training_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    global_step=global_step,
+                    epoch=self.args.training.epoch_num,
+                    micro_step_in_epoch=0,
+                    dataloader_length=len(dataloader),
+                )
 
         finally:
             self._finish_swanlab()
@@ -199,6 +231,15 @@ class PreTrainTrainer:
         if optimizer_name == "adam":
             return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
         raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
+
+    def _build_epoch_iterator(self, dataloader, micro_step_offset: int):
+        iterator = iter(dataloader)
+        for _ in range(micro_step_offset):
+            try:
+                next(iterator)
+            except StopIteration:
+                return iter(())
+        return iterator
 
     def _maybe_compile_model(
         self, model: torch.nn.Module, device: torch.device
@@ -268,6 +309,67 @@ class PreTrainTrainer:
 
     def _get_dataloader_seed(self) -> int:
         return self.args.data.dataloader_config.get("seed", self.args.training.seed)
+
+    def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
+        if hasattr(model, "_orig_mod"):
+            return model._orig_mod.state_dict()
+        return model.state_dict()
+
+    def _normalize_resume_position(
+        self, epoch: int, micro_step_in_epoch: int, dataloader_length: int
+    ) -> tuple[int, int]:
+        if dataloader_length <= 0:
+            return epoch, micro_step_in_epoch
+        normalized_epoch = epoch + micro_step_in_epoch // dataloader_length
+        normalized_micro_step = micro_step_in_epoch % dataloader_length
+        return normalized_epoch, normalized_micro_step
+
+    def _save_checkpoint_if_needed(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        global_step: int,
+        epoch: int,
+        micro_step_in_epoch: int,
+        dataloader_length: int,
+    ) -> None:
+        save_steps = self.args.checkpoint.save_steps
+        if save_steps <= 0 or global_step % save_steps != 0:
+            return
+        self._save_training_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            global_step=global_step,
+            epoch=epoch,
+            micro_step_in_epoch=micro_step_in_epoch,
+            dataloader_length=dataloader_length,
+        )
+
+    def _save_training_checkpoint(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        global_step: int,
+        epoch: int,
+        micro_step_in_epoch: int,
+        dataloader_length: int,
+    ) -> None:
+        checkpoint_epoch, checkpoint_micro_step_in_epoch = (
+            self._normalize_resume_position(
+                epoch, micro_step_in_epoch, dataloader_length
+            )
+        )
+        self.checkpoint_manager.save_checkpoint(
+            checkpoint=self._get_checkpoint_model_state(model),
+            step=global_step,
+            metadata={
+                "step": global_step,
+                "global_step": global_step,
+                "epoch": checkpoint_epoch,
+                "micro_step_in_epoch": checkpoint_micro_step_in_epoch,
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+        )
 
     def _set_seed(self, seed: int, init_cuda: bool = False) -> None:
         _set_process_seed(seed, init_cuda=init_cuda)
