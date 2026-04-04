@@ -4,7 +4,7 @@ from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import struct
 from transformers import TokenizersBackend
-from util import DType
+from dataset.simple_megatron_dataset import DType
 
 
 """
@@ -119,8 +119,8 @@ if __name__ == "__main__":
     如果添加，我们需要指定 special tokens 的列表。
     """
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("jingyaogong/minimind-3")
 
-    dataset = load_dataset("roneneldan/TinyStories", "default", split="train")
+    dataset = load_dataset("jingyaogong/minimind_dataset", "default", split="train", data_files={"train": "pretrain_t2t_mini.jsonl"})
 
-    run(dataset, "text", "tiny_stories", "train_data", tokenizer, dtype=np.uint16, add_eos_id=True)
+    run(dataset, "text", "minimind_dataset", "train_data", tokenizer, dtype=np.uint32, add_eos_id=True)

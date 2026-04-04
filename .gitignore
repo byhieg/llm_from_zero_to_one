@@ -13,3 +13,4 @@ gpt2/cache
 gpt2/data
 .sisyphus
 .ruff_cache
+train_data

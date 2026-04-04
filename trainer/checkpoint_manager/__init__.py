@@ -1,2 +1,2 @@
-from .checkpoint_manager import CheckpointManager
-__all__ = ["CheckpointManager"]
+from .checkpoint_manager import CheckpointManager, Checkpoint
+__all__ = ["CheckpointManager", "Checkpoint"]
