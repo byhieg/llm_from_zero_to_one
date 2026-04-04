@@ -35,6 +35,24 @@ def _seed_dataloader_worker(worker_id: int, base_seed: int) -> None:
     _set_process_seed(base_seed + worker_id)
 
 
+class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
+    def __init__(self, data_source, base_seed: int):
+        self.data_source = data_source
+        self.base_seed = base_seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.base_seed + self.epoch)
+        yield from torch.randperm(len(self.data_source), generator=generator).tolist()
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
 class PreTrainTrainer:
     def __init__(self, args: PretrainArgs):
         self.args = args
@@ -51,7 +69,7 @@ class PreTrainTrainer:
             dataset_config=self._get_dataset_config(),
         )
 
-        dataloader = self._build_dataloader(dataset, epoch=0)
+        dataloader = self._build_dataloader(dataset)
         device = (
             torch.device("cuda")
             if torch.cuda.is_available()
@@ -102,7 +120,7 @@ class PreTrainTrainer:
         )
         try:
             for epoch in range(start_epoch, self.args.training.epoch_num):
-                epoch_dataloader = self._build_dataloader(dataset, epoch=epoch)
+                self._set_dataloader_epoch(dataloader, epoch)
                 model.train()
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
@@ -112,7 +130,7 @@ class PreTrainTrainer:
                     start_micro_step_in_epoch if epoch == start_epoch else 0
                 )
                 epoch_iterator = self._build_epoch_iterator(
-                    epoch_dataloader, micro_step_offset
+                    dataloader, micro_step_offset
                 )
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     lr = self._get_lr(
@@ -151,7 +169,7 @@ class PreTrainTrainer:
                         global_step=global_step,
                         epoch=epoch,
                         micro_step_in_epoch=step + 1,
-                        dataloader_length=len(epoch_dataloader),
+                        dataloader_length=len(dataloader),
                     )
                     if global_step % self.args.training.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - window_start_time) * 1000
@@ -190,11 +208,9 @@ class PreTrainTrainer:
         dataset_config.setdefault("seq_len", self.args.training.seq_len)
         return dataset_config
 
-    def _build_dataloader(self, dataset, epoch: int = 0):
+    def _build_dataloader(self, dataset):
         dataloader_config = self.args.data.dataloader_config
-        dataloader_seed = self._get_epoch_dataloader_seed(epoch)
-        generator = torch.Generator()
-        generator.manual_seed(dataloader_seed)
+        dataloader_seed = self._get_dataloader_seed()
 
         num_workers = dataloader_config.get("num_workers", 0)
         persistent_workers = dataloader_config.get("persistent_workers", False)
@@ -203,18 +219,27 @@ class PreTrainTrainer:
         worker_init_fn = None
         if num_workers > 0:
             worker_init_fn = partial(_seed_dataloader_worker, base_seed=dataloader_seed)
+        sampler = None
+        shuffle = dataloader_config.get("shuffle", True)
+        if shuffle:
+            sampler = EpochSeededRandomSampler(dataset, base_seed=dataloader_seed)
 
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=self.args.training.batch_size,
-            shuffle=dataloader_config.get("shuffle", True),
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=dataloader_config.get("pin_memory", False),
             drop_last=dataloader_config.get("drop_last", False),
             persistent_workers=persistent_workers,
-            generator=generator,
+            sampler=sampler,
             worker_init_fn=worker_init_fn,
         )
+
+    def _set_dataloader_epoch(self, dataloader, epoch: int) -> None:
+        sampler = getattr(dataloader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
 
     def _build_optimizer(self, model: torch.nn.Module) -> torch.optim.Optimizer:
         optimizer_name = self.args.optimizer.name.lower()
@@ -307,9 +332,6 @@ class PreTrainTrainer:
 
     def _get_dataloader_seed(self) -> int:
         return self.args.data.dataloader_config.get("seed", self.args.training.seed)
-
-    def _get_epoch_dataloader_seed(self, epoch: int) -> int:
-        return self._get_dataloader_seed() + epoch
 
     def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
         if hasattr(model, "_orig_mod"):

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 import trainer.pretrain.pretrain as pretrain_module
-from trainer.pretrain.pretrain import PreTrainTrainer
+from trainer.pretrain.pretrain import EpochSeededRandomSampler, PreTrainTrainer
 from trainer.train_args import (
     CheckpointConfig,
     DataConfig,
@@ -84,10 +84,11 @@ def test_build_dataloader_uses_data_seed_and_config():
 
     assert dataloader.batch_size == 8
     assert dataloader.drop_last is True
-    assert dataloader.generator.initial_seed() == 123
+    assert isinstance(dataloader.sampler, EpochSeededRandomSampler)
+    assert dataloader.sampler.base_seed == 123
 
 
-def test_build_dataloader_uses_epoch_specific_seed():
+def test_build_dataloader_uses_epoch_specific_sampler_order():
     args = PretrainArgs(
         training=TrainingConfig(batch_size=8, seed=42),
         data=DataConfig(
@@ -103,9 +104,16 @@ def test_build_dataloader_uses_epoch_specific_seed():
     )
     trainer = PreTrainTrainer(args)
 
-    dataloader = trainer._build_dataloader(DummyDataset(), epoch=2)
+    dataloader = trainer._build_dataloader(DummyDataset())
+    sampler = dataloader.sampler
 
-    assert dataloader.generator.initial_seed() == 125
+    assert isinstance(sampler, EpochSeededRandomSampler)
+    sampler.set_epoch(2)
+    epoch_two_order = list(iter(sampler))
+    sampler.set_epoch(2)
+    assert list(iter(sampler)) == epoch_two_order
+    sampler.set_epoch(3)
+    assert list(iter(sampler)) != epoch_two_order
 
 
 def test_build_dataloader_worker_init_fn_is_picklable_when_num_workers_positive():
@@ -218,7 +226,7 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset, epoch=0: [])
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
@@ -321,9 +329,7 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(
-        trainer, "_build_dataloader", lambda dataset, epoch=0: dataloader
-    )
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
@@ -422,7 +428,7 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset, epoch=0: [])
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
