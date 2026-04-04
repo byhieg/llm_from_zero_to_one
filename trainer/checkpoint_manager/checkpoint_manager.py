@@ -42,7 +42,7 @@ class CheckpointManager:
             checkpoint.optimizer_state_dict, checkpoint_step_path / "optimizer.pt"
         )
 
-    def get_checkpoint(self, step: int = None) -> Checkpoint:
+    def get_checkpoint(self, step: int = None) -> Checkpoint | None:
         checkpoint_step_path = None
         if step is not None:
             checkpoint_step_path = self.checkpoint_dir / f"{step:06d}"

@@ -101,18 +101,15 @@ class PreTrainTrainer:
         )
 
         self._init_swanlab(device, dataset, dataloader)
-        checkpoint: Checkpoint = self.checkpoint_manager.get_checkpoint()
+        checkpoint: Checkpoint | None = self.checkpoint_manager.get_checkpoint()
         global_step = 0
         start_epoch = 0
         start_micro_step_in_epoch = 0
-        if checkpoint and checkpoint.metadata:
-            global_step = checkpoint.metadata.get(
-                "global_step", checkpoint.metadata.get("step", 0)
-            )
-            start_epoch = checkpoint.metadata.get("epoch", 0)
-            start_micro_step_in_epoch = checkpoint.metadata.get(
-                "micro_step_in_epoch", 0
-            )
+        if checkpoint and self._is_checkpoint_compatible(checkpoint):
+            metadata = checkpoint.metadata or {}
+            global_step = metadata.get("global_step", metadata.get("step", 0))
+            start_epoch = metadata.get("epoch", 0)
+            start_micro_step_in_epoch = metadata.get("micro_step_in_epoch", 0)
             logger.info(
                 f"Loading checkpoint from step {global_step}, "
                 f"epoch {start_epoch}, micro_step {start_micro_step_in_epoch}"
@@ -362,6 +359,47 @@ class PreTrainTrainer:
             return model._orig_mod.state_dict()
         return model.state_dict()
 
+    def _get_checkpoint_resume_config(self) -> dict:
+        return {
+            "model_name": self.args.model.name,
+            "data_strategy": self.args.data.data_strategy,
+            "training": {
+                "batch_size": self.args.training.batch_size,
+                "seq_len": self.args.training.seq_len,
+                "accumulation_steps": self.args.training.accumulation_steps,
+                "seed": self.args.training.seed,
+            },
+            "optimizer": {
+                "name": self.args.optimizer.name,
+            },
+            "dataloader": {
+                "seed": self._get_dataloader_seed(),
+                "shuffle": self.args.data.dataloader_config.get("shuffle", True),
+                "drop_last": self.args.data.dataloader_config.get("drop_last", False),
+            },
+        }
+
+    def _is_checkpoint_compatible(self, checkpoint: Checkpoint | None) -> bool:
+        if checkpoint is None:
+            return False
+        metadata = checkpoint.metadata or {}
+        checkpoint_resume_config = metadata.get("resume_config")
+        if checkpoint_resume_config is None:
+            logger.warning("checkpoint 缺少 resume_config，已跳过恢复")
+            return False
+        current_resume_config = self._get_checkpoint_resume_config()
+        if checkpoint_resume_config == current_resume_config:
+            return True
+        mismatch_keys = []
+        for key, current_value in current_resume_config.items():
+            checkpoint_value = checkpoint_resume_config.get(key)
+            if checkpoint_value != current_value:
+                mismatch_keys.append(key)
+        logger.warning(
+            f"checkpoint 配置与当前配置不一致，已跳过恢复: {', '.join(mismatch_keys)}"
+        )
+        return False
+
     def _normalize_resume_position(
         self, epoch: int, micro_step_in_epoch: int, dataloader_length: int
     ) -> tuple[int, int]:
@@ -410,14 +448,15 @@ class PreTrainTrainer:
             checkpoint=Checkpoint(
                 model_state_dict=self._get_checkpoint_model_state(model),
                 optimizer_state_dict=optimizer.state_dict(),
+                metadata={
+                    "step": global_step,
+                    "global_step": global_step,
+                    "epoch": checkpoint_epoch,
+                    "micro_step_in_epoch": checkpoint_micro_step_in_epoch,
+                    "resume_config": self._get_checkpoint_resume_config(),
+                },
             ),
             step=global_step,
-            metadata={
-                "step": global_step,
-                "global_step": global_step,
-                "epoch": checkpoint_epoch,
-                "micro_step_in_epoch": checkpoint_micro_step_in_epoch,
-            },
         )
 
     def _set_seed(self, seed: int, init_cuda: bool = False) -> None:

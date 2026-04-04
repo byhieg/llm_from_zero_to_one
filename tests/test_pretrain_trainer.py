@@ -222,20 +222,10 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
             pass
 
         def get_checkpoint(self):
-            return Checkpoint(
-                model_state_dict={
-                    "linear.weight": torch.ones((2, 4)),
-                    "linear.bias": torch.zeros(2),
-                },
-                optimizer_state_dict={
-                    "state": {},
-                    "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
-                },
-                metadata={"step": 7},
-            )
+            return None
 
-        def save_checkpoint(self, checkpoint, step, metadata):
-            calls.append(("save_checkpoint", step, metadata["epoch"]))
+        def save_checkpoint(self, checkpoint, step):
+            calls.append(("save_checkpoint", step, checkpoint.metadata["epoch"]))
 
     class FakeOptimizer:
         def __init__(self):
@@ -264,6 +254,24 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
         model=ModelConfig(name="gpt2", config={}),
     )
     trainer = PreTrainTrainer(args)
+    monkeypatch.setattr(
+        trainer.checkpoint_manager,
+        "get_checkpoint",
+        lambda: Checkpoint(
+            model_state_dict={
+                "linear.weight": torch.ones((2, 4)),
+                "linear.bias": torch.zeros(2),
+            },
+            optimizer_state_dict={
+                "state": {},
+                "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
+            },
+            metadata={
+                "step": 7,
+                "resume_config": trainer._get_checkpoint_resume_config(),
+            },
+        ),
+    )
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
@@ -320,19 +328,10 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
             self.saved_checkpoints = []
 
         def get_checkpoint(self):
-            model = TrainStepModel([])
-            return Checkpoint(
-                model_state_dict=model.state_dict(),
-                optimizer_state_dict={},
-                metadata={
-                    "global_step": 3,
-                    "epoch": 0,
-                    "micro_step_in_epoch": 2,
-                },
-            )
+            return None
 
-        def save_checkpoint(self, checkpoint, step, metadata):
-            self.saved_checkpoints.append((step, metadata))
+        def save_checkpoint(self, checkpoint, step):
+            self.saved_checkpoints.append((step, checkpoint.metadata))
 
     class FakeOptimizer:
         def __init__(self):
@@ -371,6 +370,20 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
         model=ModelConfig(name="gpt2", config={}),
     )
     trainer = PreTrainTrainer(args)
+    monkeypatch.setattr(
+        trainer.checkpoint_manager,
+        "get_checkpoint",
+        lambda: Checkpoint(
+            model_state_dict=TrainStepModel([]).state_dict(),
+            optimizer_state_dict={},
+            metadata={
+                "global_step": 3,
+                "epoch": 0,
+                "micro_step_in_epoch": 2,
+                "resume_config": trainer._get_checkpoint_resume_config(),
+            },
+        ),
+    )
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
@@ -407,9 +420,7 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
     monkeypatch.setattr(
         trainer.checkpoint_manager,
         "save_checkpoint",
-        lambda checkpoint, step, metadata: saved_checkpoints.append(
-            (checkpoint, step, metadata)
-        ),
+        lambda checkpoint, step: saved_checkpoints.append((checkpoint, step)),
     )
 
     trainer._save_training_checkpoint(
@@ -421,7 +432,8 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
         dataloader_length=4,
     )
 
-    checkpoint, step, metadata = saved_checkpoints[0]
+    checkpoint, step = saved_checkpoints[0]
+    metadata = checkpoint.metadata
 
     assert step == 6
     assert checkpoint.model_state_dict.keys() == model.state_dict().keys()
@@ -430,6 +442,7 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
     assert metadata["step"] == 6
     assert metadata["epoch"] == 1
     assert metadata["micro_step_in_epoch"] == 0
+    assert metadata["resume_config"] == trainer._get_checkpoint_resume_config()
 
 
 def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
@@ -442,8 +455,8 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
         def get_checkpoint(self):
             return None
 
-        def save_checkpoint(self, checkpoint, step, metadata):
-            saved_checkpoints.append((checkpoint, step, metadata))
+        def save_checkpoint(self, checkpoint, step):
+            saved_checkpoints.append((checkpoint, step))
 
     class FakeOptimizer:
         def __init__(self):
@@ -483,11 +496,44 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
     trainer.run()
 
     assert len(saved_checkpoints) == 1
-    _, step, metadata = saved_checkpoints[0]
+    checkpoint, step = saved_checkpoints[0]
+    metadata = checkpoint.metadata
     assert step == 0
     assert metadata["global_step"] == 0
     assert metadata["epoch"] == 0
     assert metadata["micro_step_in_epoch"] == 0
+
+
+def test_is_checkpoint_compatible_returns_false_when_resume_config_mismatch(caplog):
+    trainer = PreTrainTrainer(
+        PretrainArgs(
+            training=TrainingConfig(batch_size=8, seed=123),
+            data=DataConfig(
+                data_strategy="padding", dataset_config={"data_path": "demo"}
+            ),
+            model=ModelConfig(name="gpt2", config={}),
+        )
+    )
+
+    checkpoint = Checkpoint(
+        model_state_dict={},
+        optimizer_state_dict={},
+        metadata={
+            "resume_config": {
+                **trainer._get_checkpoint_resume_config(),
+                "training": {
+                    **trainer._get_checkpoint_resume_config()["training"],
+                    "batch_size": 4,
+                },
+            }
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        is_compatible = trainer._is_checkpoint_compatible(checkpoint)
+
+    assert is_compatible is False
+    assert "checkpoint 配置与当前配置不一致" in caplog.text
 
 
 def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):
