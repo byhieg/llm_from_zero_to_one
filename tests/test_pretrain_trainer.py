@@ -165,6 +165,9 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
                 },
             }
 
+        def save_checkpoint(self, checkpoint, step, metadata):
+            calls.append(("save_checkpoint", step, metadata["epoch"]))
+
     class FakeOptimizer:
         def __init__(self):
             self.param_groups = [{"lr": 0.0}]
@@ -174,6 +177,9 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
 
         def zero_grad(self):
             pass
+
+        def state_dict(self):
+            return {"optimizer": "state"}
 
     monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
     monkeypatch.setattr(
@@ -234,6 +240,7 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     assert calls[2] == ("build_optimizer", calls[1][1])
     assert calls[3] == ("optimizer.load_state_dict", expected_optimizer_state)
     assert calls[4] == ("compile", calls[1][1])
+    assert calls[5] == ("save_checkpoint", 7, 0)
 
 
 def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
@@ -350,6 +357,64 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
     assert metadata["epoch"] == 1
     assert metadata["micro_step_in_epoch"] == 0
     assert "optimizer_state_dict" in metadata
+
+
+def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
+    saved_checkpoints = []
+
+    class FakeCheckpointManager:
+        def __init__(self, checkpoint_config, model_name):
+            pass
+
+        def get_checkpoint(self):
+            return None, None
+
+        def save_checkpoint(self, checkpoint, step, metadata):
+            saved_checkpoints.append((checkpoint, step, metadata))
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+        def zero_grad(self):
+            pass
+
+        def state_dict(self):
+            return {"optimizer": "state"}
+
+    monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
+    monkeypatch.setattr(
+        pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
+    )
+    monkeypatch.setattr(
+        pretrain_module, "create_model", lambda *args, **kwargs: DummyModel()
+    )
+
+    args = PretrainArgs(
+        training=TrainingConfig(epoch_num=0),
+        checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/test-pretrain"),
+        data=DataConfig(data_strategy="padding", dataset_config={"data_path": "demo"}),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+
+    monkeypatch.setattr(trainer, "_init_seed", lambda: None)
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
+    monkeypatch.setattr(
+        trainer, "_init_swanlab", lambda device, dataset, dataloader: None
+    )
+    monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
+    monkeypatch.setattr(trainer, "_maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
+
+    trainer.run()
+
+    assert len(saved_checkpoints) == 1
+    _, step, metadata = saved_checkpoints[0]
+    assert step == 0
+    assert metadata["global_step"] == 0
+    assert metadata["epoch"] == 0
+    assert metadata["micro_step_in_epoch"] == 0
 
 
 def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):

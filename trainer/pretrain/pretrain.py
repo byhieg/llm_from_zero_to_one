@@ -100,7 +100,6 @@ class PreTrainTrainer:
             * self.args.training.accumulation_steps
             * self.args.training.log_steps
         )
-        did_update = False
         try:
             for epoch in range(start_epoch, self.args.training.epoch_num):
                 model.train()
@@ -145,7 +144,6 @@ class PreTrainTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
-                    did_update = True
                     self._save_checkpoint_if_needed(
                         model=model,
                         optimizer=optimizer,
@@ -169,15 +167,14 @@ class PreTrainTrainer:
 
                     accumulated_loss = torch.tensor(0.0, device=device)
                 start_micro_step_in_epoch = 0
-            if did_update:
-                self._save_training_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    global_step=global_step,
-                    epoch=self.args.training.epoch_num,
-                    micro_step_in_epoch=0,
-                    dataloader_length=len(dataloader),
-                )
+            self._save_training_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                global_step=global_step,
+                epoch=self.args.training.epoch_num,
+                micro_step_in_epoch=0,
+                dataloader_length=len(dataloader),
+            )
 
         finally:
             self._finish_swanlab()
