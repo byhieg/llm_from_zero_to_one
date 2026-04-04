@@ -51,7 +51,7 @@ class PreTrainTrainer:
             dataset_config=self._get_dataset_config(),
         )
 
-        dataloader = self._build_dataloader(dataset)
+        dataloader = self._build_dataloader(dataset, epoch=0)
         device = (
             torch.device("cuda")
             if torch.cuda.is_available()
@@ -102,6 +102,7 @@ class PreTrainTrainer:
         )
         try:
             for epoch in range(start_epoch, self.args.training.epoch_num):
+                epoch_dataloader = self._build_dataloader(dataset, epoch=epoch)
                 model.train()
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
@@ -111,7 +112,7 @@ class PreTrainTrainer:
                     start_micro_step_in_epoch if epoch == start_epoch else 0
                 )
                 epoch_iterator = self._build_epoch_iterator(
-                    dataloader, micro_step_offset
+                    epoch_dataloader, micro_step_offset
                 )
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     lr = self._get_lr(
@@ -150,7 +151,7 @@ class PreTrainTrainer:
                         global_step=global_step,
                         epoch=epoch,
                         micro_step_in_epoch=step + 1,
-                        dataloader_length=len(dataloader),
+                        dataloader_length=len(epoch_dataloader),
                     )
                     if global_step % self.args.training.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - window_start_time) * 1000
@@ -189,9 +190,9 @@ class PreTrainTrainer:
         dataset_config.setdefault("seq_len", self.args.training.seq_len)
         return dataset_config
 
-    def _build_dataloader(self, dataset):
+    def _build_dataloader(self, dataset, epoch: int = 0):
         dataloader_config = self.args.data.dataloader_config
-        dataloader_seed = self._get_dataloader_seed()
+        dataloader_seed = self._get_epoch_dataloader_seed(epoch)
         generator = torch.Generator()
         generator.manual_seed(dataloader_seed)
 
@@ -306,6 +307,9 @@ class PreTrainTrainer:
 
     def _get_dataloader_seed(self) -> int:
         return self.args.data.dataloader_config.get("seed", self.args.training.seed)
+
+    def _get_epoch_dataloader_seed(self, epoch: int) -> int:
+        return self._get_dataloader_seed() + epoch
 
     def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
         if hasattr(model, "_orig_mod"):

@@ -87,6 +87,27 @@ def test_build_dataloader_uses_data_seed_and_config():
     assert dataloader.generator.initial_seed() == 123
 
 
+def test_build_dataloader_uses_epoch_specific_seed():
+    args = PretrainArgs(
+        training=TrainingConfig(batch_size=8, seed=42),
+        data=DataConfig(
+            data_strategy="padding",
+            dataset_config={"data_path": "demo"},
+            dataloader_config={
+                "seed": 123,
+                "shuffle": True,
+                "num_workers": 0,
+            },
+        ),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+
+    dataloader = trainer._build_dataloader(DummyDataset(), epoch=2)
+
+    assert dataloader.generator.initial_seed() == 125
+
+
 def test_build_dataloader_worker_init_fn_is_picklable_when_num_workers_positive():
     args = PretrainArgs(
         training=TrainingConfig(batch_size=8, seed=42),
@@ -197,7 +218,7 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset, epoch=0: [])
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
@@ -300,7 +321,9 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
+    monkeypatch.setattr(
+        trainer, "_build_dataloader", lambda dataset, epoch=0: dataloader
+    )
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
@@ -399,7 +422,7 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
     trainer = PreTrainTrainer(args)
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
-    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset, epoch=0: [])
     monkeypatch.setattr(
         trainer, "_init_swanlab", lambda device, dataset, dataloader: None
     )
