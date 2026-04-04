@@ -5,7 +5,7 @@ from importlib import import_module
 
 import math
 
-from ..checkpoint_manager import CheckpointManager
+from ..checkpoint_manager import CheckpointManager, Checkpoint
 from ..train_args import PretrainArgs
 
 from logger import get_logger
@@ -36,18 +36,29 @@ def _seed_dataloader_worker(worker_id: int, base_seed: int) -> None:
 
 
 class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
-    def __init__(self, data_source, base_seed: int):
+    def __init__(self, data_source, base_seed: int, shuffle: bool = True):
         self.data_source = data_source
         self.base_seed = base_seed
+        self.shuffle = shuffle
         self.epoch = 0
+        self.sample_offset = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
+    def set_micro_step_offset(self, micro_step_offset: int, batch_size: int) -> None:
+        self.sample_offset = max(0, micro_step_offset * batch_size)
+
     def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed(self.base_seed + self.epoch)
-        yield from torch.randperm(len(self.data_source), generator=generator).tolist()
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.base_seed + self.epoch)
+            indices = torch.randperm(
+                len(self.data_source), generator=generator
+            ).tolist()
+        else:
+            indices = range(len(self.data_source))
+        yield from indices[self.sample_offset :]
 
     def __len__(self) -> int:
         return len(self.data_source)
@@ -90,25 +101,29 @@ class PreTrainTrainer:
         )
 
         self._init_swanlab(device, dataset, dataloader)
-        model_checkpoint, metadata = self.checkpoint_manager.get_checkpoint()
+        checkpoint: Checkpoint = self.checkpoint_manager.get_checkpoint()
         global_step = 0
         start_epoch = 0
         start_micro_step_in_epoch = 0
-        if model_checkpoint:
-            global_step = metadata.get("global_step", metadata.get("step", 0))
-            start_epoch = metadata.get("epoch", 0)
-            start_micro_step_in_epoch = metadata.get("micro_step_in_epoch", 0)
+        if checkpoint and checkpoint.metadata:
+            global_step = checkpoint.metadata.get(
+                "global_step", checkpoint.metadata.get("step", 0)
+            )
+            start_epoch = checkpoint.metadata.get("epoch", 0)
+            start_micro_step_in_epoch = checkpoint.metadata.get(
+                "micro_step_in_epoch", 0
+            )
             logger.info(
                 f"Loading checkpoint from step {global_step}, "
                 f"epoch {start_epoch}, micro_step {start_micro_step_in_epoch}"
             )
-            model.load_state_dict(model_checkpoint)
+            model.load_state_dict(checkpoint.model_state_dict)
         else:
             logger.info("No checkpoint found, starting from scratch")
         model = model.to(device)
         optimizer = self._build_optimizer(model)
-        if metadata and metadata.get("optimizer_state_dict"):
-            optimizer.load_state_dict(metadata["optimizer_state_dict"])
+        if checkpoint and checkpoint.optimizer_state_dict:
+            optimizer.load_state_dict(checkpoint.optimizer_state_dict)
         model = self._maybe_compile_model(model, device)
         logger.info(f"优化器: {type(optimizer).__name__}")
         accumulated_loss = torch.tensor(0.0, device=device)
@@ -125,7 +140,7 @@ class PreTrainTrainer:
                 optimizer.zero_grad()
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
-                window_start_time = time.perf_counter()
+                start_time = time.perf_counter()
                 micro_step_offset = (
                     start_micro_step_in_epoch if epoch == start_epoch else 0
                 )
@@ -148,9 +163,9 @@ class PreTrainTrainer:
                     ) % self.args.training.accumulation_steps != 0
                     if device == torch.device("cuda") and self.args.training.amp:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            logits, loss = model(x, y)
+                            _, loss = model(x, y)
                     else:
-                        logits, loss = model(x, y)
+                        _, loss = model(x, y)
                     loss = loss / self.args.training.accumulation_steps
                     loss.backward()
                     accumulated_loss += loss.detach()
@@ -172,7 +187,7 @@ class PreTrainTrainer:
                         dataloader_length=len(dataloader),
                     )
                     if global_step % self.args.training.log_steps == 0:
-                        elapsed_ms = (time.perf_counter() - window_start_time) * 1000
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
                         self._log_swanlab(
                             {
                                 "train/step": global_step,
@@ -182,10 +197,10 @@ class PreTrainTrainer:
                                 "train/throughput": int(tokens / (elapsed_ms / 1000)),
                             }
                         )
-                        window_start_time = time.perf_counter()
+                        start_time = time.perf_counter()
 
                     accumulated_loss = torch.tensor(0.0, device=device)
-                start_micro_step_in_epoch = 0
+
             self._save_training_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -219,10 +234,12 @@ class PreTrainTrainer:
         worker_init_fn = None
         if num_workers > 0:
             worker_init_fn = partial(_seed_dataloader_worker, base_seed=dataloader_seed)
-        sampler = None
         shuffle = dataloader_config.get("shuffle", True)
-        if shuffle:
-            sampler = EpochSeededRandomSampler(dataset, base_seed=dataloader_seed)
+        sampler = EpochSeededRandomSampler(
+            dataset,
+            base_seed=dataloader_seed,
+            shuffle=shuffle,
+        )
 
         return torch.utils.data.DataLoader(
             dataset,
@@ -256,6 +273,13 @@ class PreTrainTrainer:
         raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
 
     def _build_epoch_iterator(self, dataloader, micro_step_offset: int):
+        sampler = getattr(dataloader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_micro_step_offset"):
+            batch_size = getattr(dataloader, "batch_size", None)
+            if batch_size is None:
+                raise ValueError("dataloader.batch_size must be set for resume skip")
+            sampler.set_micro_step_offset(micro_step_offset, batch_size)
+            return iter(dataloader)
         iterator = iter(dataloader)
         for _ in range(micro_step_offset):
             try:
@@ -383,14 +407,16 @@ class PreTrainTrainer:
             )
         )
         self.checkpoint_manager.save_checkpoint(
-            checkpoint=self._get_checkpoint_model_state(model),
+            checkpoint=Checkpoint(
+                model_state_dict=self._get_checkpoint_model_state(model),
+                optimizer_state_dict=optimizer.state_dict(),
+            ),
             step=global_step,
             metadata={
                 "step": global_step,
                 "global_step": global_step,
                 "epoch": checkpoint_epoch,
                 "micro_step_in_epoch": checkpoint_micro_step_in_epoch,
-                "optimizer_state_dict": optimizer.state_dict(),
             },
         )
 

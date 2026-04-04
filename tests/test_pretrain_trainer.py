@@ -6,6 +6,7 @@ import torch.nn as nn
 
 import trainer.pretrain.pretrain as pretrain_module
 from trainer.pretrain.pretrain import EpochSeededRandomSampler, PreTrainTrainer
+from trainer.checkpoint_manager import Checkpoint
 from trainer.train_args import (
     CheckpointConfig,
     DataConfig,
@@ -40,6 +41,19 @@ class TrainStepModel(nn.Module):
         self.processed_batches.append(int(x.reshape(-1)[0].item()))
         loss = self.weight * 0 + x.float().mean() * 0
         return x, loss
+
+
+class CountingDataset(torch.utils.data.Dataset):
+    def __init__(self, size: int):
+        self.size = size
+        self.visited_indices = []
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, index):
+        self.visited_indices.append(index)
+        return torch.tensor(index), torch.tensor(index)
 
 
 def test_get_dataset_config_inherits_training_seq_len():
@@ -116,6 +130,31 @@ def test_build_dataloader_uses_epoch_specific_sampler_order():
     assert list(iter(sampler)) != epoch_two_order
 
 
+def test_build_epoch_iterator_skips_batches_via_sampler_offset():
+    args = PretrainArgs(
+        training=TrainingConfig(batch_size=2),
+        data=DataConfig(
+            data_strategy="padding",
+            dataset_config={"data_path": "demo"},
+            dataloader_config={
+                "seed": 123,
+                "shuffle": False,
+                "num_workers": 0,
+            },
+        ),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+    trainer = PreTrainTrainer(args)
+    dataset = CountingDataset(8)
+    dataloader = trainer._build_dataloader(dataset)
+
+    iterator = trainer._build_epoch_iterator(dataloader, micro_step_offset=2)
+    first_batch = next(iterator)
+
+    assert dataset.visited_indices == [4, 5]
+    assert first_batch[0].tolist() == [4, 5]
+
+
 def test_build_dataloader_worker_init_fn_is_picklable_when_num_workers_positive():
     args = PretrainArgs(
         training=TrainingConfig(batch_size=8, seed=42),
@@ -183,16 +222,17 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
             pass
 
         def get_checkpoint(self):
-            return {
-                "linear.weight": torch.ones((2, 4)),
-                "linear.bias": torch.zeros(2),
-            }, {
-                "step": 7,
-                "optimizer_state_dict": {
+            return Checkpoint(
+                model_state_dict={
+                    "linear.weight": torch.ones((2, 4)),
+                    "linear.bias": torch.zeros(2),
+                },
+                optimizer_state_dict={
                     "state": {},
                     "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
                 },
-            }
+                metadata={"step": 7},
+            )
 
         def save_checkpoint(self, checkpoint, step, metadata):
             calls.append(("save_checkpoint", step, metadata["epoch"]))
@@ -281,11 +321,15 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
 
         def get_checkpoint(self):
             model = TrainStepModel([])
-            return model.state_dict(), {
-                "global_step": 3,
-                "epoch": 0,
-                "micro_step_in_epoch": 2,
-            }
+            return Checkpoint(
+                model_state_dict=model.state_dict(),
+                optimizer_state_dict={},
+                metadata={
+                    "global_step": 3,
+                    "epoch": 0,
+                    "micro_step_in_epoch": 2,
+                },
+            )
 
         def save_checkpoint(self, checkpoint, step, metadata):
             self.saved_checkpoints.append((step, metadata))
@@ -380,12 +424,12 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
     checkpoint, step, metadata = saved_checkpoints[0]
 
     assert step == 6
-    assert checkpoint.keys() == model.state_dict().keys()
+    assert checkpoint.model_state_dict.keys() == model.state_dict().keys()
+    assert checkpoint.optimizer_state_dict == optimizer.state_dict()
     assert metadata["global_step"] == 6
     assert metadata["step"] == 6
     assert metadata["epoch"] == 1
     assert metadata["micro_step_in_epoch"] == 0
-    assert "optimizer_state_dict" in metadata
 
 
 def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
@@ -396,7 +440,7 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
             pass
 
         def get_checkpoint(self):
-            return None, None
+            return None
 
         def save_checkpoint(self, checkpoint, step, metadata):
             saved_checkpoints.append((checkpoint, step, metadata))

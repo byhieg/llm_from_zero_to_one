@@ -2,10 +2,20 @@ from ..train_args import CheckpointConfig
 from pathlib import Path
 import torch
 import json
+from dataclasses import dataclass
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Checkpoint:
+    model_state_dict: dict
+
+    optimizer_state_dict: dict
+
+    metadata: dict = None
 
 
 class CheckpointManager:
@@ -20,16 +30,19 @@ class CheckpointManager:
         if not self.checkpoint_dir.exists():
             self.checkpoint_dir.mkdir(parents=True)
 
-    def save_checkpoint(self, checkpoint: dict, step: int, metadata: dict = None):
+    def save_checkpoint(self, checkpoint: Checkpoint, step: int):
         checkpoint_step_path = self.checkpoint_dir / f"{step:06d}"
         checkpoint_step_path.mkdir(parents=True, exist_ok=True)
-        if metadata:
+        if checkpoint.metadata:
             meta_path = checkpoint_step_path / type(self).METADATA_FILE
             with open(meta_path, "w") as f:
-                json.dump(metadata, f, indent=4)
-        torch.save(checkpoint, checkpoint_step_path / "model.pt")
+                json.dump(checkpoint.metadata, f, indent=4)
+        torch.save(checkpoint.model_state_dict, checkpoint_step_path / "model.pt")
+        torch.save(
+            checkpoint.optimizer_state_dict, checkpoint_step_path / "optimizer.pt"
+        )
 
-    def get_checkpoint(self, step: int = None) -> tuple[dict, dict]:
+    def get_checkpoint(self, step: int = None) -> Checkpoint:
         checkpoint_step_path = None
         if step is not None:
             checkpoint_step_path = self.checkpoint_dir / f"{step:06d}"
@@ -50,13 +63,20 @@ class CheckpointManager:
                     continue
                 checkpoint_dirs.append(path)
             if not checkpoint_dirs:
-                return None, None
+                return None
             checkpoint_step_path = max(checkpoint_dirs, key=lambda path: int(path.name))
-        model_checkpoint = torch.load(
+        model_state_dict = torch.load(
             checkpoint_step_path / "model.pt", weights_only=False
+        )
+        optimizer_state_dict = torch.load(
+            checkpoint_step_path / "optimizer.pt", weights_only=False
         )
         metadata = {}
         if (checkpoint_step_path / type(self).METADATA_FILE).exists():
             with open(checkpoint_step_path / type(self).METADATA_FILE, "r") as f:
                 metadata = json.load(f)
-        return model_checkpoint, metadata
+        return Checkpoint(
+            model_state_dict=model_state_dict,
+            optimizer_state_dict=optimizer_state_dict,
+            metadata=metadata,
+        )
