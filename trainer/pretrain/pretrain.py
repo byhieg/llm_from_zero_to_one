@@ -355,8 +355,6 @@ class PreTrainTrainer:
         return self.args.data.dataloader_config.get("seed", self.args.training.seed)
 
     def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
-        if hasattr(model, "_orig_mod"):
-            return model._orig_mod.state_dict()
         return model.state_dict()
 
     def _get_checkpoint_resume_config(self) -> dict:
@@ -467,14 +465,3 @@ class PreTrainTrainer:
         self._set_seed(seed, init_cuda=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-    def _synchronize_device(self, device: torch.device) -> None:
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elif (
-            device.type == "mps"
-            and hasattr(torch, "mps")
-            and hasattr(torch.mps, "synchronize")
-            and torch.backends.mps.is_available()
-        ):
-            torch.mps.synchronize()
