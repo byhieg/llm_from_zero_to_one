@@ -1,7 +1,21 @@
+"""MiniMind 数据预处理工具 —— 将原始文本数据集转换为 Megatron 格式的 .bin + .idx 文件
+
+本脚本模仿 Megatron-LM 数据处理模块，对 MiniMind 原始文本数据集进行分词预处理，
+产出可直接用于训练的二进制文件：
+
+- **.bin 文件**：分词后的 token 序列，以 numpy memmap 格式存储（支持 uint16/uint32 等 dtype）
+- **.idx 文件**：索引文件，记录每个文档在 .bin 中的字节偏移位置
+
+输出格式兼容 Megatron-LM 的 IndexedDataset 规范，可被 SimpleMegatronDataset 直接加载。
+
+用法::
+
+    python tools/llm_data_processor.py
+"""
+
 import os
 import sys
 from pathlib import Path
-import importlib
 import numpy as np
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
@@ -13,7 +27,7 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DType = importlib.import_module("dataset.simple_megatron_dataset").DType
+from dataset.simple_megatron_dataset import DType  # noqa: E402
 
 
 """
@@ -41,6 +55,18 @@ def run(
     add_eos_id=False,
     dtype=np.int32,
 ):
+    """将 HuggingFace 数据集转换为 Megatron 格式的 .bin + .idx 文件
+
+    Args:
+        dataset: HuggingFace Dataset 对象
+        column_name: 文本字段名（默认 "text"）
+        output_name: 输出文件名（不含扩展名）
+        output_dir: 输出目录
+        tokenizer: 分词器实例
+        add_bos_id: 是否在开头添加 BOS token
+        add_eos_id: 是否在结尾添加 EOS token
+        dtype: .bin 文件的数据类型（如 np.uint32，需与词表大小匹配）
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     def process(example) -> dict:
@@ -113,20 +139,7 @@ def run(
 
 
 if __name__ == "__main__":
-    """
-    模仿 megatron 数据模块，对原始文本进行处理。产出 idx 和 bin 文件。
-
-    bin 文件是直接 tokenizer 之后的 token 序列。numpy 格式。需要根据词典大小指定 dtype
-
-    index 文件是 bin 文件的索引，他记录了每个原始文本在 bin 文件中的位置。
-
-    这里是处理单数据集的，如果多数据集只需要多次调用这个脚本即可。
-
-    这里原始文档，我们成为 doc。doc 是数据集中的一条记录，他可以是一段话，或者一段代码。
-
-    同时我们可以指定是否添加 special tokens。
-    如果添加，我们需要指定 special tokens 的列表。
-    """
+    """默认入口：使用 MiniMind 数据集和分词器生成 .bin + .idx 文件"""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained("jingyaogong/minimind-3")
