@@ -39,3 +39,8 @@ testpaths = ["tests"]
 [tool.ruff]
 # 忽略 jaxtyping 语法导致的 F722 错误
 ignore = ["F722"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.9",
+]

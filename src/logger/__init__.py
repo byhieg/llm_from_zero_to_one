@@ -59,11 +59,12 @@ class _PlainFormatter(logging.Formatter):
 class _RankFilter(logging.Filter):
     def __init__(self, rank: int = 0) -> None:
         super().__init__()
-        self.rank: int = rank
+        self.target_rank: int = rank
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.rank = getattr(record, "rank", self.rank)  # type: ignore[attr-defined]
-        return getattr(record, "rank", 0) == self.rank
+        current_rank = _get_rank()
+        record.rank = current_rank  # type: ignore[attr-defined]
+        return current_rank == self.target_rank
 
 
 _log_once_set: set[int] = set()

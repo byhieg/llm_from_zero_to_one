@@ -11,7 +11,7 @@ def main():
     from logger import init_logger
     from trainer import run
 
-    init_logger("INFO",rank=0)
+    init_logger("INFO")
     run()
 
 

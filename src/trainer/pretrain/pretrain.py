@@ -14,7 +14,7 @@ from dataset import create_dataset
 from logger import get_logger
 from models import create_model
 import os
-from torch.utils.data import Sampler, DistributedSampler
+from torch.utils.data import DistributedSampler
 
 from ..train_args import PretrainArgs
 
@@ -506,14 +506,14 @@ class PreTrainTrainer:
                     "eval/sample_count": metrics["sample_count"],
                 }
             )
-            
+
         if self._is_distributed():
             dist.barrier()
 
         return time.perf_counter() - eval_start_time if self._is_main_process() else 0.0
 
     def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
-        # for ddp 
+        # for ddp
         if hasattr(model, "module"):
             model = model.module
         if hasattr(model, "_orig_mod"):
