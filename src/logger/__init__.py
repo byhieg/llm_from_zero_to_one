@@ -240,7 +240,7 @@ def init_logger(
 
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(numeric_level)
-    console.addFilter(_RankFilter(rank=rank))
+    console.addFilter(_RankFilter())
     if use_color:
         console.setFormatter(_ColorFormatter(fmt=fmt, datefmt=datefmt))
     else:
