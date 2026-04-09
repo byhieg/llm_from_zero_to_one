@@ -90,12 +90,11 @@ class PreTrainTrainer:
 
         logger.info(model)
         logger.info(f"dataset size: {len(dataset)} samples")
-        if self._is_distributed():
-            logger.info(
-                f"ddp info: world_size={world_size}, "
-                f"rank={self.rank_info['rank']}, "
-                f"local_rank={self.rank_info['local_rank']}"
-            )
+        logger.info(
+            f"world_size={world_size}, "
+            f"rank={self.rank_info['rank']}, "
+            f"local_rank={self.rank_info['local_rank']}"
+        )
         logger.info(f"train device: {device}")
         logger.info(
             f"batch size: {per_gpu_batch_size} per GPU × {world_size} GPU = {total_batch_size} total"
