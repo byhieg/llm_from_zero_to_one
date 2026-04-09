@@ -8,10 +8,13 @@ import time
 
 from checkpoint_manager import CheckpointManager, Checkpoint
 import torch
+import torch.distributed as dist
 from evaluator import PretrainEvaluator
 from dataset import create_dataset
 from logger import get_logger
 from models import create_model
+import os
+from torch.utils.data import Sampler, DistributedSampler
 
 from ..train_args import PretrainArgs
 
@@ -36,33 +39,23 @@ def _seed_dataloader_worker(worker_id: int, base_seed: int) -> None:
     _set_process_seed(base_seed + worker_id)
 
 
-class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
-    def __init__(self, data_source, base_seed: int, shuffle: bool = True):
-        self.data_source = data_source
-        self.base_seed = base_seed
-        self.shuffle = shuffle
-        self.epoch = 0
-        self.sample_offset = 0
+class ResumableDistributedSampler(DistributedSampler):
+    """支持 checkpoint 断点续训的分布式采样器
 
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
+    在 DistributedSampler 基础上，增加根据 micro_step 跳过已训练数据的能力。
+    """
+
+    def __init__(self, dataset, **kwargs):
+        super().__init__(dataset, **kwargs)
+        self.sample_offset = 0
 
     def set_micro_step_offset(self, micro_step_offset: int, batch_size: int) -> None:
         self.sample_offset = max(0, micro_step_offset * batch_size)
 
     def __iter__(self):
-        if self.shuffle:
-            generator = torch.Generator()
-            generator.manual_seed(self.base_seed + self.epoch)
-            indices = torch.randperm(
-                len(self.data_source), generator=generator
-            ).tolist()
-        else:
-            indices = range(len(self.data_source))
+        # 直接复用父类的分片逻辑
+        indices = list(super().__iter__())
         yield from indices[self.sample_offset :]
-
-    def __len__(self) -> int:
-        return len(self.data_source)
 
 
 class PreTrainTrainer:
@@ -77,6 +70,9 @@ class PreTrainTrainer:
 
     def run(self) -> None:
         self._init_seed()
+
+        self.rank_info = self._build_distributed()
+        device = self._get_device()
         model = create_model(self.args.model.name, self._get_model_config())
         dataset = create_dataset(
             data_strategy=self.args.data.data_strategy,
@@ -84,16 +80,10 @@ class PreTrainTrainer:
         )
 
         dataloader = self._build_dataloader(dataset)
-        device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("mps")
-            if getattr(torch.backends, "mps", None)
-            and torch.backends.mps.is_available()
-            else torch.device("cpu")
-        )
+
         steps_per_epoch = len(dataloader) // self.args.training.accumulation_steps
         max_steps = self.args.training.epoch_num * steps_per_epoch
+
         logger.info(model)
         logger.info(f"dataset size: {len(dataset)} samples")
         logger.info(f"train device: {device}")
@@ -118,15 +108,24 @@ class PreTrainTrainer:
                 f"epoch {start_epoch}, micro_step {start_micro_step_in_epoch}"
             )
             model.load_state_dict(checkpoint.model_state_dict)
+            if self._is_distributed():
+                dist.barrier()
         else:
             logger.info("No checkpoint found, starting from scratch")
-        self._init_swanlab(device, dataset, dataloader, run_id=self._swanlab_run_id)
+
+        if self._is_main_process():
+            self._init_swanlab(device, dataset, dataloader, run_id=self._swanlab_run_id)
+
         model = model.to(device)
         optimizer = self._build_optimizer(model)
         grad_scaler = self._build_grad_scaler(device)
         if checkpoint and checkpoint.optimizer_state_dict:
             optimizer.load_state_dict(checkpoint.optimizer_state_dict)
         model = self._maybe_compile_model(model, device)
+        if self._is_distributed():
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[self.rank_info["local_rank"]]
+            )
         logger.info(f"optimizer: {type(optimizer).__name__}")
         accumulated_loss = torch.tensor(0.0, device=device)
         tokens = (
@@ -134,6 +133,7 @@ class PreTrainTrainer:
             * self.args.training.seq_len
             * self.args.training.accumulation_steps
             * self.args.training.log_steps
+            * self.rank_info["world_size"]
         )
         try:
             eval_elapsed_since_log = 0.0
@@ -236,6 +236,56 @@ class PreTrainTrainer:
         finally:
             self._finish_swanlab()
 
+    def _build_distributed(self):
+        if not dist.is_initialized():
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            if world_size > 1:
+                if torch.cuda.is_available():
+                    dist.init_process_group(backend="nccl")
+                else:
+                    raise ValueError(
+                        "CUDA is not available, but distributed training is enabled."
+                    )
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+            node_rank = int(os.environ.get("NODE_RANK", 0))
+        else:
+            world_size = 1
+            rank = 0
+            local_rank = 0
+            local_world_size = 1
+            node_rank = 0
+
+        return {
+            "world_size": world_size,
+            "rank": rank,
+            "local_rank": local_rank,
+            "local_world_size": local_world_size,
+            "node_rank": node_rank,
+            "is_distributed": world_size > 1,
+            "is_multi_node": world_size > local_world_size,
+        }
+
+    def _is_distributed(self) -> bool:
+        return self.rank_info["is_distributed"]
+
+    def _get_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            if self.rank_info["is_distributed"]:
+                local_rank = self.rank_info["local_rank"]
+                torch.cuda.set_device(local_rank)
+                return torch.device(f"cuda:{local_rank}")
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def _is_main_process(self) -> bool:
+        return self.rank_info["rank"] == 0
+
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
         model_config.setdefault("block_size", self.args.training.seq_len)
@@ -261,10 +311,12 @@ class PreTrainTrainer:
         if num_workers > 0:
             worker_init_fn = partial(_seed_dataloader_worker, base_seed=dataloader_seed)
         shuffle = dataloader_config.get("shuffle", True)
-        sampler = EpochSeededRandomSampler(
+        sampler = ResumableDistributedSampler(
             dataset,
-            base_seed=dataloader_seed,
+            seed=dataloader_seed,
             shuffle=shuffle,
+            num_replicas=self.rank_info["world_size"],
+            rank=self.rank_info["rank"],
         )
 
         return torch.utils.data.DataLoader(
@@ -365,14 +417,16 @@ class PreTrainTrainer:
 
     def _log_swanlab(self, data: dict) -> None:
         if self._swanlab is not None:
-            self._swanlab.log(data)
+            if self._is_main_process():
+                self._swanlab.log(data)
 
         logger.info(data)
 
     def _finish_swanlab(self) -> None:
         if self._swanlab is not None:
-            self._swanlab.finish()
-            self._swanlab = None
+            if self._is_main_process():
+                self._swanlab.finish()
+                self._swanlab = None
 
     def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
         config = asdict(self.args)
@@ -397,7 +451,9 @@ class PreTrainTrainer:
         return learning_rate * coeff
 
     def _get_dataloader_seed(self) -> int:
-        return self.args.data.dataloader_config.get("seed", self.args.training.seed)
+        return self.args.data.dataloader_config.get(
+            "seed", 42 if not self.args.training.seed else self.args.training.seed
+        )
 
     def _is_amp_enabled(self, device: torch.device) -> bool:
         return device.type == "cuda" and self.args.training.amp
@@ -434,24 +490,32 @@ class PreTrainTrainer:
             return 0.0
         if global_step <= 0 or global_step % self.args.eval.steps != 0:
             return 0.0
-        eval_start_time = time.perf_counter()
-        metrics = self._get_pretrain_evaluator().evaluate_model(
-            model=model,
-            device=device,
-            checkpoint_step=global_step,
-        )
-        self._log_swanlab(
-            {
-                "eval/step": global_step,
-                "eval/loss": metrics["loss"],
-                "eval/perplexity": metrics["perplexity"],
-                "eval/token_count": metrics["token_count"],
-                "eval/sample_count": metrics["sample_count"],
-            }
-        )
-        return time.perf_counter() - eval_start_time
+        if self._is_main_process():
+            eval_start_time = time.perf_counter()
+            metrics = self._get_pretrain_evaluator().evaluate_model(
+                model=model,
+                device=device,
+                checkpoint_step=global_step,
+            )
+            self._log_swanlab(
+                {
+                    "eval/step": global_step,
+                    "eval/loss": metrics["loss"],
+                    "eval/perplexity": metrics["perplexity"],
+                    "eval/token_count": metrics["token_count"],
+                    "eval/sample_count": metrics["sample_count"],
+                }
+            )
+            
+        if self._is_distributed():
+            dist.barrier()
+
+        return time.perf_counter() - eval_start_time if self._is_main_process() else 0.0
 
     def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
+        # for ddp 
+        if hasattr(model, "module"):
+            model = model.module
         if hasattr(model, "_orig_mod"):
             return model._orig_mod.state_dict()
         return model.state_dict()
@@ -461,6 +525,7 @@ class PreTrainTrainer:
             "checkpoint_model_name": self._get_checkpoint_model_name(),
             "model_arch": self.args.model.name,
             "data_strategy": self.args.data.data_strategy,
+            "world_size": self.rank_info["world_size"],
             "training": {
                 "batch_size": self.args.training.batch_size,
                 "seq_len": self.args.training.seq_len,
@@ -535,6 +600,8 @@ class PreTrainTrainer:
         micro_step_in_epoch: int,
         dataloader_length: int,
     ) -> None:
+        if not self._is_main_process():
+            return
         checkpoint_epoch, checkpoint_micro_step_in_epoch = (
             self._normalize_resume_position(
                 epoch, micro_step_in_epoch, dataloader_length
