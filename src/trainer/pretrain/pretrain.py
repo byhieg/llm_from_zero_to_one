@@ -84,10 +84,26 @@ class PreTrainTrainer:
         steps_per_epoch = len(dataloader) // self.args.training.accumulation_steps
         max_steps = self.args.training.epoch_num * steps_per_epoch
 
+        world_size = self.rank_info["world_size"]
+        per_gpu_batch_size = self.args.training.batch_size
+        total_batch_size = per_gpu_batch_size * world_size
+
         logger.info(model)
         logger.info(f"dataset size: {len(dataset)} samples")
+        if self._is_distributed():
+            logger.info(
+                f"ddp info: world_size={world_size}, "
+                f"rank={self.rank_info['rank']}, "
+                f"local_rank={self.rank_info['local_rank']}"
+            )
         logger.info(f"train device: {device}")
-        logger.info(f"dataloader batch num: {len(dataloader)}")
+        logger.info(
+            f"batch size: {per_gpu_batch_size} per GPU × {world_size} GPU = {total_batch_size} total"
+        )
+        logger.info(
+            f"dataloader batch num: {len(dataloader)} per GPU, "
+            f"total batch num: {len(dataloader) * world_size}"
+        )
         logger.info(
             f"total steps num: {max_steps} (epoch_num: {self.args.training.epoch_num}, "
             f"perepoch steps: {steps_per_epoch}, accumulation_steps: {self.args.training.accumulation_steps}, eval_steps: {self.args.eval.steps})"
