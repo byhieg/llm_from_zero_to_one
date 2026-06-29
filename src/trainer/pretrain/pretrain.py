@@ -16,7 +16,7 @@ from models import create_model
 import os
 from torch.utils.data import DistributedSampler
 
-from ..train_args import PretrainArgs
+from .pretrain_args import PretrainArgs
 
 logger = get_logger(__name__)
 
@@ -81,7 +81,7 @@ class PreTrainTrainer:
 
         dataloader = self._build_dataloader(dataset)
 
-        steps_per_epoch = len(dataloader) // self.args.training.accumulation_steps
+        steps_per_epoch = len(dataloader) // self.args.training.naive_config.get("accumulation_steps", 4)
         max_steps = self.args.training.epoch_num * steps_per_epoch
 
         world_size = self.rank_info["world_size"]
@@ -105,7 +105,7 @@ class PreTrainTrainer:
         )
         logger.info(
             f"total steps num: {max_steps} (epoch_num: {self.args.training.epoch_num}, "
-            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {self.args.training.accumulation_steps}, eval_steps: {self.args.eval.steps})"
+            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {self.args.training.naive_config.get('accumulation_steps', 4)}, eval_steps: {self.args.eval.steps})"
         )
 
         checkpoint: Checkpoint | None = self.checkpoint_manager.get_checkpoint()
@@ -146,7 +146,7 @@ class PreTrainTrainer:
         tokens = (
             self.args.training.batch_size
             * self.args.training.seq_len
-            * self.args.training.accumulation_steps
+            * self.args.training.naive_config.get("accumulation_steps", 4)
             * self.args.training.log_steps
             * self.rank_info["world_size"]
         )
@@ -178,7 +178,7 @@ class PreTrainTrainer:
                     )
                     should_skip_optimizer_step = (
                         step + 1
-                    ) % self.args.training.accumulation_steps != 0
+                    ) % self.args.training.naive_config.get("accumulation_steps", 4) != 0
                     if self._is_amp_enabled(device):
                         with torch.autocast(
                             device_type="cuda",
@@ -187,7 +187,7 @@ class PreTrainTrainer:
                             _, loss = model(x, y)
                     else:
                         _, loss = model(x, y)
-                    loss = loss / self.args.training.accumulation_steps
+                    loss = loss / self.args.training.naive_config.get("accumulation_steps", 4)
                     if grad_scaler is not None:
                         grad_scaler.scale(loss).backward()
                     else:
@@ -199,7 +199,7 @@ class PreTrainTrainer:
                     if grad_scaler is not None:
                         grad_scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.args.training.grad_clip
+                        model.parameters(), self.args.training.naive_config.get("grad_clip", 1.0)
                     )
                     if grad_scaler is not None:
                         grad_scaler.step(optimizer)
@@ -354,7 +354,7 @@ class PreTrainTrainer:
     def _build_optimizer(self, model: torch.nn.Module) -> torch.optim.Optimizer:
         optimizer_name = self.args.optimizer.name.lower()
         optimizer_kwargs = {
-            "lr": self.args.training.learning_rate,
+            "lr": self.args.training.naive_config.get("learning_rate", 3e-4),
             "weight_decay": self.args.optimizer.weight_decay,
             "betas": tuple(self.args.optimizer.betas),
             "eps": self.args.optimizer.eps,
@@ -407,19 +407,19 @@ class PreTrainTrainer:
         dataloader,
         run_id: str | None = None,
     ) -> None:
-        if not self.args.swanlab.enabled:
+        if not self.args.experiment.enabled:
             return
         try:
             self._swanlab = import_module("swanlab")
         except ImportError as exc:
             raise ImportError(
-                "swanlab.enabled=true but swanlab is not installed, please install it first."
+                "experiment.enabled=true but swanlab is not installed, please install it first."
             ) from exc
         run = self._swanlab.init(
-            project=self.args.swanlab.project,
-            experiment_name=self.args.swanlab.experiment_name,
+            project=self.args.experiment.project,
+            experiment_name=self.args.experiment.experiment_name,
             config=self._build_swanlab_config(device, dataset, dataloader),
-            tags=self.args.swanlab.tags,
+            tags=self.args.experiment.tags,
             id=run_id if run_id else None,
             resume="allow" if run_id else None,
         )
@@ -445,7 +445,7 @@ class PreTrainTrainer:
 
     def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
         config = asdict(self.args)
-        config.pop("swanlab", None)
+        config.pop("experiment", None)
         config["data"]["dataset_config"] = self._get_dataset_config()
         config["runtime"] = {
             "dataset_size": len(dataset),
@@ -455,8 +455,8 @@ class PreTrainTrainer:
         return config
 
     def _get_lr(self, step: int, max_steps: int) -> float:
-        warmup_steps = self.args.training.warmup_steps
-        learning_rate = self.args.training.learning_rate
+        warmup_steps = self.args.training.naive_config.get("warmup_steps", 10)
+        learning_rate = self.args.training.naive_config.get("learning_rate", 3e-4)
         if step < warmup_steps:
             return learning_rate * step / warmup_steps
         if step > max_steps:
@@ -471,14 +471,15 @@ class PreTrainTrainer:
         )
 
     def _is_amp_enabled(self, device: torch.device) -> bool:
-        return device.type == "cuda" and self.args.training.amp
+        return device.type == "cuda" and self.args.training.naive_config.get("amp", False)
 
     def _get_amp_dtype(self) -> torch.dtype:
-        if self.args.training.amp_dtype == "bf16":
+        amp_dtype = self.args.training.naive_config.get("amp_dtype", "bf16")
+        if amp_dtype == "bf16":
             return torch.bfloat16
-        if self.args.training.amp_dtype == "fp16":
+        if amp_dtype == "fp16":
             return torch.float16
-        raise ValueError(f"Unsupported amp dtype: {self.args.training.amp_dtype}")
+        raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
 
     def _build_grad_scaler(self, device: torch.device) -> torch.amp.GradScaler | None:
         if not self._is_amp_enabled(device):
@@ -544,7 +545,7 @@ class PreTrainTrainer:
             "training": {
                 "batch_size": self.args.training.batch_size,
                 "seq_len": self.args.training.seq_len,
-                "accumulation_steps": self.args.training.accumulation_steps,
+                "accumulation_steps": self.args.training.naive_config.get("accumulation_steps", 4),
                 "seed": self.args.training.seed,
             },
             "optimizer": {

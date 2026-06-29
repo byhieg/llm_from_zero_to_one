@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from trainer.train_args import CheckpointConfig
+from trainer.common_args import CheckpointConfig
 
 logger = logging.getLogger(__name__)
 COMPILED_MODEL_PREFIX = "_orig_mod."

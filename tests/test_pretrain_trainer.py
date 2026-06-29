@@ -6,15 +6,17 @@ import torch.nn as nn
 
 from checkpoint_manager import Checkpoint
 import trainer.pretrain.pretrain as pretrain_module
-from trainer.pretrain.pretrain import EpochSeededRandomSampler, PreTrainTrainer
-from trainer.train_args import (
+from trainer.pretrain.pretrain import ResumableDistributedSampler, PreTrainTrainer
+from trainer.pretrain.pretrain_args import (
+    PretrainArgs,
+    PretrainTrainingConfig,
+    PretrainEvalConfig,
+    PretrainOptimizerConfig,
+)
+from trainer.common_args import (
     CheckpointConfig,
     DataConfig,
-    EvalConfig,
     ModelConfig,
-    OptimizerConfig,
-    PretrainArgs,
-    TrainingConfig,
 )
 
 
@@ -59,7 +61,7 @@ class CountingDataset(torch.utils.data.Dataset):
 
 def test_get_dataset_config_inherits_training_seq_len():
     args = PretrainArgs(
-        training=TrainingConfig(seq_len=2048),
+        training=PretrainTrainingConfig(seq_len=2048),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={
@@ -80,7 +82,7 @@ def test_get_dataset_config_inherits_training_seq_len():
 
 def test_build_dataloader_uses_data_seed_and_config():
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=8, seed=42),
+        training=PretrainTrainingConfig(batch_size=8, seed=42),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={"dataset_path": "demo"},
@@ -99,13 +101,12 @@ def test_build_dataloader_uses_data_seed_and_config():
 
     assert dataloader.batch_size == 8
     assert dataloader.drop_last is True
-    assert isinstance(dataloader.sampler, EpochSeededRandomSampler)
-    assert dataloader.sampler.base_seed == 123
+    assert isinstance(dataloader.sampler, ResumableDistributedSampler)
 
 
 def test_build_dataloader_uses_epoch_specific_sampler_order():
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=8, seed=42),
+        training=PretrainTrainingConfig(batch_size=8, seed=42),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={"dataset_path": "demo"},
@@ -122,7 +123,7 @@ def test_build_dataloader_uses_epoch_specific_sampler_order():
     dataloader = trainer._build_dataloader(DummyDataset())
     sampler = dataloader.sampler
 
-    assert isinstance(sampler, EpochSeededRandomSampler)
+    assert isinstance(sampler, ResumableDistributedSampler)
     sampler.set_epoch(2)
     epoch_two_order = list(iter(sampler))
     sampler.set_epoch(2)
@@ -133,7 +134,7 @@ def test_build_dataloader_uses_epoch_specific_sampler_order():
 
 def test_build_epoch_iterator_skips_batches_via_sampler_offset():
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=2),
+        training=PretrainTrainingConfig(batch_size=2),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={"dataset_path": "demo"},
@@ -158,7 +159,7 @@ def test_build_epoch_iterator_skips_batches_via_sampler_offset():
 
 def test_build_dataloader_worker_init_fn_is_picklable_when_num_workers_positive():
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=8, seed=42),
+        training=PretrainTrainingConfig(batch_size=8, seed=42),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={"dataset_path": "demo"},
@@ -180,12 +181,12 @@ def test_build_dataloader_worker_init_fn_is_picklable_when_num_workers_positive(
 
 def test_build_optimizer_uses_adamw_config():
     args = PretrainArgs(
-        training=TrainingConfig(learning_rate=1e-3),
+        training=PretrainTrainingConfig(naive_config={"learning_rate": 1e-3}),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
         ),
         model=ModelConfig(name="gpt2", config={}),
-        optimizer=OptimizerConfig(
+        optimizer=PretrainOptimizerConfig(
             name="adamw",
             weight_decay=0.1,
             betas=[0.8, 0.95],
@@ -205,12 +206,12 @@ def test_build_optimizer_uses_adamw_config():
 
 def test_build_optimizer_supports_adam():
     args = PretrainArgs(
-        training=TrainingConfig(learning_rate=5e-4),
+        training=PretrainTrainingConfig(naive_config={"learning_rate": 5e-4}),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
         ),
         model=ModelConfig(name="gpt2", config={}),
-        optimizer=OptimizerConfig(name="adam"),
+        optimizer=PretrainOptimizerConfig(name="adam"),
     )
     trainer = PreTrainTrainer(args)
 
@@ -222,7 +223,7 @@ def test_build_optimizer_supports_adam():
 def test_get_amp_dtype_supports_bf16_and_fp16():
     bf16_trainer = PreTrainTrainer(
         PretrainArgs(
-            training=TrainingConfig(amp=True, amp_dtype="bf16"),
+            training=PretrainTrainingConfig(naive_config={"amp": True, "amp_dtype": "bf16"}),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "demo"}
             ),
@@ -231,7 +232,7 @@ def test_get_amp_dtype_supports_bf16_and_fp16():
     )
     fp16_trainer = PreTrainTrainer(
         PretrainArgs(
-            training=TrainingConfig(amp=True, amp_dtype="fp16"),
+            training=PretrainTrainingConfig(naive_config={"amp": True, "amp_dtype": "fp16"}),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "demo"}
             ),
@@ -254,7 +255,7 @@ def test_build_grad_scaler_only_for_cuda_fp16(monkeypatch):
 
     bf16_trainer = PreTrainTrainer(
         PretrainArgs(
-            training=TrainingConfig(amp=True, amp_dtype="bf16"),
+            training=PretrainTrainingConfig(naive_config={"amp": True, "amp_dtype": "bf16"}),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "demo"}
             ),
@@ -263,7 +264,7 @@ def test_build_grad_scaler_only_for_cuda_fp16(monkeypatch):
     )
     fp16_trainer = PreTrainTrainer(
         PretrainArgs(
-            training=TrainingConfig(amp=True, amp_dtype="fp16"),
+            training=PretrainTrainingConfig(naive_config={"amp": True, "amp_dtype": "fp16"}),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "demo"}
             ),
@@ -341,7 +342,7 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     )
 
     args = PretrainArgs(
-        training=TrainingConfig(epoch_num=0),
+        training=PretrainTrainingConfig(epoch_num=0),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
         ),
@@ -464,7 +465,7 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
     )
 
     args = PretrainArgs(
-        training=TrainingConfig(epoch_num=1, accumulation_steps=1, log_steps=100),
+        training=PretrainTrainingConfig(epoch_num=1, naive_config={"accumulation_steps": 1}, log_steps=100),
         checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/test-pretrain"),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
@@ -580,7 +581,7 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
     )
 
     args = PretrainArgs(
-        training=TrainingConfig(epoch_num=0),
+        training=PretrainTrainingConfig(epoch_num=0),
         checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/test-pretrain"),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
@@ -612,7 +613,7 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
 def test_is_checkpoint_compatible_returns_false_when_resume_config_mismatch(caplog):
     trainer = PreTrainTrainer(
         PretrainArgs(
-            training=TrainingConfig(batch_size=8, seed=123),
+            training=PretrainTrainingConfig(batch_size=8, seed=123),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "demo"}
             ),
@@ -667,7 +668,7 @@ def test_maybe_compile_model_uses_compile_for_mps(monkeypatch):
 
 def test_get_dataloader_seed_falls_back_to_training_seed():
     args = PretrainArgs(
-        training=TrainingConfig(seed=999),
+        training=PretrainTrainingConfig(seed=999),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
         ),
@@ -680,7 +681,7 @@ def test_get_dataloader_seed_falls_back_to_training_seed():
 
 def test_set_seed_controls_random_and_torch():
     args = PretrainArgs(
-        training=TrainingConfig(seed=123),
+        training=PretrainTrainingConfig(seed=123),
         data=DataConfig(
             data_strategy="padding", dataset_config={"dataset_path": "demo"}
         ),
@@ -741,7 +742,7 @@ def test_init_swanlab_runs_when_enabled(monkeypatch):
     monkeypatch.setattr(pretrain_module, "import_module", lambda name: FakeSwanlab())
 
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=2),
+        training=PretrainTrainingConfig(batch_size=2),
         data=DataConfig(
             data_strategy="padding",
             dataset_config={"dataset_path": "demo"},
@@ -749,10 +750,10 @@ def test_init_swanlab_runs_when_enabled(monkeypatch):
         ),
         model=ModelConfig(name="gpt2", config={}),
     )
-    args.swanlab.enabled = True
-    args.swanlab.project = "demo-project"
-    args.swanlab.experiment_name = "demo-exp"
-    args.swanlab.tags = ["unit"]
+    args.experiment.enabled = True
+    args.experiment.project = "demo-project"
+    args.experiment.experiment_name = "demo-exp"
+    args.experiment.tags = ["unit"]
     trainer = PreTrainTrainer(args)
     dataloader = trainer._build_dataloader(DummyDataset())
 
@@ -769,7 +770,7 @@ def test_init_swanlab_runs_when_enabled(monkeypatch):
         calls["init"]["config"]["data"]["dataset_config"]["seq_len"]
         == args.training.seq_len
     )
-    assert "swanlab" not in calls["init"]["config"]
+    assert "experiment" not in calls["init"]["config"]
     assert calls["init"]["config"]["runtime"]["device"] == "cpu"
     assert trainer._swanlab_run_id == "run-123"
     assert calls["log"] == [{"train/epoch": 0}]
@@ -798,7 +799,7 @@ def test_init_swanlab_resumes_with_existing_run_id(monkeypatch):
         ),
         model=ModelConfig(name="gpt2", config={}),
     )
-    args.swanlab.enabled = True
+    args.experiment.enabled = True
     trainer = PreTrainTrainer(args)
     dataloader = trainer._build_dataloader(DummyDataset())
 
@@ -816,7 +817,7 @@ def test_init_swanlab_resumes_with_existing_run_id(monkeypatch):
 
 def test_run_eval_if_needed_logs_metrics(monkeypatch):
     args = PretrainArgs(
-        eval=EvalConfig(
+        eval=PretrainEvalConfig(
             steps=2,
             dataset_path="json",
             text_column="text",

@@ -10,7 +10,7 @@ from checkpoint_manager import CheckpointManager
 from dataset import PretrainPaddingDataset
 from logger import get_logger
 from models import create_model
-from trainer.train_args import EvalArgs
+from .eval_args import EvalArgs
 
 logger = get_logger(__name__)
 

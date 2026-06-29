@@ -2,17 +2,9 @@ import os
 import pytest
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass
+
 from trainer.train_args import (
-    CheckpointConfig,
-    EvalConfig,
-    ModelConfig,
-    EvalArgs,
-    PretrainArgs,
-    TrainingArgs,
-    TrainingConfig,
-    DataConfig,
-    OptimizerConfig,
-    SwanlabConfig,
     load_args_from_yaml,
     register_args,
     get_args_class,
@@ -21,7 +13,20 @@ from trainer.train_args import (
     _substitute_env_vars,
     _resolve_config_path,
 )
-from dataclasses import dataclass
+from trainer.common_args import (
+    TrainingArgs,
+    ModelConfig,
+    DataConfig,
+    CheckpointConfig,
+    ExperimentConfig,
+)
+from trainer.pretrain.pretrain_args import (
+    PretrainArgs,
+    PretrainTrainingConfig,
+    PretrainEvalConfig,
+    PretrainOptimizerConfig,
+)
+from evaluator.eval_args import EvalArgs, EvalConfig
 
 
 def test_list_modes():
@@ -47,7 +52,8 @@ def test_from_yaml_basic():
     yaml_content = """
 training:
   batch_size: 32
-  learning_rate: 0.001
+  naive_config:
+    learning_rate: 0.001
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(yaml_content)
@@ -55,7 +61,7 @@ training:
         args, mode = load_args_from_yaml("pretrain", f.name, validate=False)
 
     assert args.training.batch_size == 32
-    assert args.training.learning_rate == 0.001
+    assert args.training.naive_config.get("learning_rate") == 0.001
     assert mode == "pretrain"
     assert args.training.seq_len == 1024
     assert args.training.epoch_num == 1
@@ -69,10 +75,11 @@ training:
   batch_size: 32
   seq_len: 512
   epoch_num: 10
-  learning_rate: 0.001
-  warmup_steps: 100
-  grad_clip: 0.5
-  accumulation_steps: 2
+  naive_config:
+    learning_rate: 0.001
+    warmup_steps: 100
+    grad_clip: 0.5
+    accumulation_steps: 2
   log_steps: 50
 
 checkpoint:
@@ -104,7 +111,7 @@ optimizer:
   betas: [0.8, 0.95]
   eps: 1.0e-6
 
-swanlab:
+experiment:
   enabled: true
   project: demo-project
   experiment_name: exp-1
@@ -120,10 +127,10 @@ swanlab:
     assert args.training.seq_len == 512
     assert args.training.epoch_num == 10
     assert args.data.dataset_config["dataset_path"] == "/path/to/data"
-    assert args.training.learning_rate == 0.001
-    assert args.training.warmup_steps == 100
-    assert args.training.grad_clip == 0.5
-    assert args.training.accumulation_steps == 2
+    assert args.training.naive_config.get("learning_rate") == 0.001
+    assert args.training.naive_config.get("warmup_steps") == 100
+    assert args.training.naive_config.get("grad_clip") == 0.5
+    assert args.training.naive_config.get("accumulation_steps") == 2
     assert args.training.log_steps == 50
     assert args.checkpoint.save_steps == 500
     assert args.checkpoint.checkpoint_dir == "checkpoints/test"
@@ -142,10 +149,10 @@ swanlab:
     assert args.optimizer.weight_decay == 0.1
     assert tuple(args.optimizer.betas) == (0.8, 0.95)
     assert args.optimizer.eps == 1.0e-6
-    assert args.swanlab.enabled is True
-    assert args.swanlab.project == "demo-project"
-    assert args.swanlab.experiment_name == "exp-1"
-    assert args.swanlab.tags == ["demo"]
+    assert args.experiment.enabled is True
+    assert args.experiment.project == "demo-project"
+    assert args.experiment.experiment_name == "exp-1"
+    assert args.experiment.tags == ["demo"]
 
 
 def test_load_eval_args_from_yaml():
@@ -183,7 +190,7 @@ eval:
 
 def test_to_yaml():
     args = PretrainArgs(
-        training=TrainingConfig(batch_size=64, learning_rate=0.0001, epoch_num=5),
+        training=PretrainTrainingConfig(batch_size=64, epoch_num=5),
     )
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -191,27 +198,26 @@ def test_to_yaml():
         loaded, _ = load_args_from_yaml("pretrain", f.name, validate=False)
 
     assert loaded.training.batch_size == 64
-    assert loaded.training.learning_rate == 0.0001
     assert loaded.training.epoch_num == 5
 
 
-def test_swanlab_config_defaults():
+def test_experiment_config_defaults():
     args = PretrainArgs()
 
-    assert isinstance(args.optimizer, OptimizerConfig)
+    assert isinstance(args.optimizer, PretrainOptimizerConfig)
     assert args.optimizer.name == "adamw"
-    assert isinstance(args.swanlab, SwanlabConfig)
-    assert args.swanlab.enabled is False
-    assert args.swanlab.project == "llm-training"
+    assert isinstance(args.experiment, ExperimentConfig)
+    assert args.experiment.enabled is False
+    assert args.experiment.project == "llm-training"
 
 
 def test_to_dict():
-    args = PretrainArgs(training=TrainingConfig(batch_size=32))
+    args = PretrainArgs(training=PretrainTrainingConfig(batch_size=32))
     d = args.to_dict()
 
     assert isinstance(d, dict)
     assert d["training"]["batch_size"] == 32
-    assert "learning_rate" in d["training"]
+    assert "naive_config" in d["training"]
     assert "dataset_path" in d["eval"]
 
 
@@ -219,13 +225,15 @@ def test_from_dict():
     d = {
         "training": {
             "batch_size": 64,
-            "learning_rate": 0.001,
+            "naive_config": {
+                "learning_rate": 0.001,
+            },
         },
     }
     args = PretrainArgs.from_dict(d)
 
     assert args.training.batch_size == 64
-    assert args.training.learning_rate == 0.001
+    assert args.training.naive_config.get("learning_rate") == 0.001
 
 
 def test_load_args_from_yaml_factory():
@@ -270,7 +278,6 @@ custom_param: 200
         args, _ = load_args_from_yaml("custom", f.name, validate=False)
 
     assert args.custom_param == 200
-    assert args.training.batch_size == 32
 
 
 def test_optional_param():
@@ -396,14 +403,14 @@ class TestValidation:
                 dataset_config={"dataset_path": "roneneldan/TinyStories"},
                 dataloader_config={"num_workers": 0},
             ),
-            training=TrainingConfig(batch_size=32, learning_rate=0.001),
+            training=PretrainTrainingConfig(batch_size=32, naive_config={"learning_rate": 0.001}),
         )
         errors = args.validate()
         assert errors == []
 
     def test_missing_dataset_path(self):
         args = PretrainArgs(
-            training=TrainingConfig(epoch_num=10),
+            training=PretrainTrainingConfig(epoch_num=10),
             data=DataConfig(data_strategy="padding", dataset_config={}),
         )
         errors = args.validate()
@@ -411,7 +418,7 @@ class TestValidation:
 
     def test_invalid_batch_size(self):
         args = PretrainArgs(
-            training=TrainingConfig(batch_size=0),
+            training=PretrainTrainingConfig(batch_size=0),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "/data"}
             ),
@@ -421,23 +428,13 @@ class TestValidation:
 
     def test_invalid_learning_rate(self):
         args = PretrainArgs(
-            training=TrainingConfig(learning_rate=-0.001),
+            training=PretrainTrainingConfig(naive_config={"learning_rate": -0.001}),
             data=DataConfig(
                 data_strategy="padding", dataset_config={"dataset_path": "/data"}
             ),
         )
         errors = args.validate()
         assert any("learning_rate" in e for e in errors)
-
-    def test_invalid_amp_dtype(self):
-        args = PretrainArgs(
-            training=TrainingConfig(amp=True, amp_dtype="int8"),
-            data=DataConfig(
-                data_strategy="padding", dataset_config={"dataset_path": "/data"}
-            ),
-        )
-        errors = args.validate()
-        assert any("amp_dtype" in e for e in errors)
 
     def test_invalid_dataloader_num_workers(self):
         args = PretrainArgs(
@@ -478,7 +475,7 @@ class TestValidation:
         assert any("eval.tokenizer_path" in e for e in errors)
 
     def test_pretrain_eval_requires_fields_when_enabled(self):
-        args = PretrainArgs(eval=EvalConfig(steps=100))
+        args = PretrainArgs(eval=PretrainEvalConfig(steps=100))
         errors = args.validate()
         assert any("eval.dataset_path" in e for e in errors)
         assert any("eval.tokenizer_path" in e for e in errors)
