@@ -1,7 +1,16 @@
-from .pretrain import PreTrainTrainer
-from .pretrain_args import PreTrainArgs
-from trainer.train_args import register_args
+from __future__ import annotations
 
-register_args("pretrain", PreTrainArgs)
+from typing import TYPE_CHECKING, Any
 
-__all__ = ["PreTrainTrainer", "PreTrainArgs"]
+if TYPE_CHECKING:
+    from .pretrain import PreTrainTrainer
+
+__all__ = ["PreTrainTrainer"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "PreTrainTrainer":
+        from .pretrain import PreTrainTrainer
+
+        return PreTrainTrainer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

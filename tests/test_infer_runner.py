@@ -2,7 +2,7 @@ import torch
 
 from checkpoint_manager import Checkpoint
 import evaluator.checkpoint_evaluator as evaluator_module
-from evaluator import PretrainEvaluator
+from evaluator.checkpoint_evaluator import PretrainEvaluator
 from evaluator.eval_args import EvalArgs, EvalCheckpointConfig, EvalConfig
 from trainer.common_args import ModelConfig
 

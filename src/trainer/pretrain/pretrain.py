@@ -1,25 +1,21 @@
-import json
-import math
 import os
 import random
 import time
-from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from functools import partial
 from importlib import import_module
-from pathlib import Path
-from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 
-from checkpoint_manager import Checkpoint, CheckpointManager
+from checkpoint_manager import Checkpoint
 from dataset import create_dataset
-from evaluator import PretrainEvaluator
+from evaluator.checkpoint_evaluator import PretrainEvaluator
 from logger import get_logger
 from models import create_model
 
+from . import deepspeed_train, naive_train
 from .pretrain_args import PreTrainArgs
 
 logger = get_logger(__name__)
@@ -62,209 +58,6 @@ class ResumableDistributedSampler(DistributedSampler):
         yield from indices[self.sample_offset :]
 
 
-@dataclass
-class _BackendState:
-    """后端运行时状态。"""
-
-    model: torch.nn.Module
-    optimizer: Any
-    grad_scaler: torch.amp.GradScaler | None
-    accumulation_steps: int
-
-
-class _BaseBackendRuntime:
-    """训练后端运行时抽象。"""
-
-    def __init__(self, trainer: "PreTrainTrainer", device: torch.device):
-        self.trainer = trainer
-        self.args = trainer.args
-        self.device = device
-        self.state: _BackendState | None = None
-
-    def get_accumulation_steps(self) -> int:
-        if self.state is not None:
-            return self.state.accumulation_steps
-        return 1
-
-    def is_optimizer_step(self, micro_step: int) -> bool:
-        accumulation_steps = self.get_accumulation_steps()
-        return micro_step % accumulation_steps == 0
-
-    def get_backward_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        return loss
-
-    def get_log_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        return loss / self.get_accumulation_steps()
-
-    def forward_context(self):
-        return nullcontext()
-
-    def prepare(
-        self,
-        model: torch.nn.Module,
-        checkpoint: Checkpoint | None,
-    ) -> _BackendState:
-        raise NotImplementedError
-
-    def backward(self, loss: torch.Tensor) -> None:
-        raise NotImplementedError
-
-    def clip_grad_norm(self, max_norm: float) -> torch.Tensor:
-        raise NotImplementedError
-
-    def step(self) -> None:
-        raise NotImplementedError
-
-    def zero_grad(self) -> None:
-        raise NotImplementedError
-
-    def set_learning_rate(self, lr: float) -> None:
-        for param_group in self._get_optimizer().param_groups:
-            param_group["lr"] = lr
-
-    def _get_model(self) -> torch.nn.Module:
-        if self.state is None:
-            raise RuntimeError("backend runtime has not been prepared")
-        return self.state.model
-
-    def _get_optimizer(self):
-        if self.state is None:
-            raise RuntimeError("backend runtime has not been prepared")
-        return self.state.optimizer
-
-    def _get_grad_scaler(self) -> torch.amp.GradScaler | None:
-        if self.state is None:
-            raise RuntimeError("backend runtime has not been prepared")
-        return self.state.grad_scaler
-
-
-class _NaiveBackendRuntime(_BaseBackendRuntime):
-    """PyTorch 原生训练后端。"""
-
-    def prepare(
-        self,
-        model: torch.nn.Module,
-        checkpoint: Checkpoint | None,
-    ) -> _BackendState:
-        model = model.to(self.device)
-        optimizer = self.trainer._build_optimizer(model)
-        grad_scaler = self.trainer._build_grad_scaler(self.device)
-        if checkpoint and checkpoint.optimizer_state_dict:
-            optimizer.load_state_dict(checkpoint.optimizer_state_dict)
-        model = self.trainer._maybe_compile_model(model, self.device)
-        if self.trainer._is_distributed():
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[self.trainer.rank_info["local_rank"]]
-            )
-        self.state = _BackendState(
-            model=model,
-            optimizer=optimizer,
-            grad_scaler=grad_scaler,
-            accumulation_steps=self.trainer._get_gradient_accumulation_steps(),
-        )
-        return self.state
-
-    def get_backward_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        return loss / self.get_accumulation_steps()
-
-    def backward(self, loss: torch.Tensor) -> None:
-        grad_scaler = self._get_grad_scaler()
-        if grad_scaler is not None:
-            grad_scaler.scale(loss).backward()
-            return
-        loss.backward()
-
-    def clip_grad_norm(self, max_norm: float) -> torch.Tensor:
-        grad_scaler = self._get_grad_scaler()
-        optimizer = self._get_optimizer()
-        if grad_scaler is not None:
-            grad_scaler.unscale_(optimizer)
-        return torch.nn.utils.clip_grad_norm_(self._get_model().parameters(), max_norm)
-
-    def step(self) -> None:
-        grad_scaler = self._get_grad_scaler()
-        optimizer = self._get_optimizer()
-        if grad_scaler is not None:
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-            return
-        optimizer.step()
-
-    def zero_grad(self) -> None:
-        self._get_optimizer().zero_grad()
-
-    def forward_context(self):
-        if not self.trainer._is_amp_enabled(self.device):
-            return nullcontext()
-        return torch.autocast(
-            device_type="cuda",
-            dtype=self.trainer._get_amp_dtype(),
-        )
-
-
-class _DeepSpeedBackendRuntime(_BaseBackendRuntime):
-    """DeepSpeed 训练后端。"""
-
-    def __init__(self, trainer: "PreTrainTrainer", device: torch.device):
-        super().__init__(trainer, device)
-        self.deepspeed_config = trainer._load_deepspeed_config()
-
-    def get_accumulation_steps(self) -> int:
-        if self.state is not None:
-            return self.state.accumulation_steps
-        return self.trainer._resolve_gradient_accumulation_steps(
-            self.deepspeed_config.get("gradient_accumulation_steps", 1)
-        )
-
-    def prepare(
-        self,
-        model: torch.nn.Module,
-        checkpoint: Checkpoint | None,
-    ) -> _BackendState:
-        deepspeed = self.trainer._import_deepspeed()
-        model = model.to(self.device)
-        optimizer = self.trainer._build_optimizer(model)
-        engine, engine_optimizer, _, _ = deepspeed.initialize(
-            model=model,
-            model_parameters=model.parameters(),
-            optimizer=optimizer,
-            config=self.deepspeed_config,
-        )
-        if (
-            checkpoint
-            and checkpoint.optimizer_state_dict
-            and engine_optimizer is not None
-        ):
-            engine_optimizer.load_state_dict(checkpoint.optimizer_state_dict)
-        self.state = _BackendState(
-            model=engine,
-            optimizer=engine_optimizer or optimizer,
-            grad_scaler=None,
-            accumulation_steps=self.get_accumulation_steps(),
-        )
-        return self.state
-
-    def backward(self, loss: torch.Tensor) -> None:
-        self._get_model().backward(loss)
-
-    def clip_grad_norm(self, max_norm: float) -> torch.Tensor:
-        grad_norm_getter = getattr(self._get_model(), "get_global_grad_norm", None)
-        if callable(grad_norm_getter):
-            grad_norm = grad_norm_getter()
-            if isinstance(grad_norm, torch.Tensor):
-                return grad_norm
-            return torch.tensor(float(grad_norm), device=self.device)
-        return torch.tensor(0.0, device=self.device)
-
-    def step(self) -> None:
-        self._get_model().step()
-
-    def zero_grad(self) -> None:
-        zero_grad = getattr(self._get_model(), "zero_grad", None)
-        if callable(zero_grad):
-            zero_grad()
-
-
 class PreTrainTrainer:
     """预训练 Trainer。"""
 
@@ -282,13 +75,11 @@ class PreTrainTrainer:
         self._swanlab = None
         self._swanlab_run_id: str | None = None
         self._evaluator = None
-        self.checkpoint_manager = CheckpointManager(
-            args.checkpoint, self._get_checkpoint_model_name()
-        )
+        self._deepspeed_runtime: deepspeed_train.DeepSpeedPretrainRuntime | None = None
+        self.checkpoint_manager = None
 
     def run(self) -> None:
         self._init_seed()
-
         self.rank_info = self._build_distributed()
         device = self._get_device()
         model = create_model(self.args.model.name, self._get_model_config())
@@ -297,16 +88,19 @@ class PreTrainTrainer:
             dataset_config=self._get_train_dataset_config(),
         )
         dataloader = self._build_dataloader(dataset)
-        backend_runtime = self._build_backend_runtime(device)
-        accumulation_steps = backend_runtime.get_accumulation_steps()
-        steps_per_epoch = len(dataloader) // accumulation_steps
-        max_steps = self.args.train.epoch_num * steps_per_epoch
 
         world_size = self.rank_info["world_size"]
         per_gpu_batch_size = self.args.train.batch_size
         total_batch_size = per_gpu_batch_size * world_size
+        trainable_params = (
+            model.count_parameters()
+            if hasattr(model, "count_parameters")
+            else sum(p.numel() for p in model.parameters() if p.requires_grad)
+        )
 
-        logger.info(model)
+        logger.info(
+            f"model: {model.__class__.__name__}, trainable_params={trainable_params:,}"
+        )
         logger.info(f"dataset size: {len(dataset)} samples")
         logger.info(
             f"world_size={world_size}, "
@@ -321,39 +115,24 @@ class PreTrainTrainer:
             f"dataloader batch num: {len(dataloader)} per GPU, "
             f"total batch num: {len(dataloader) * world_size}"
         )
-        logger.info(
-            f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
-            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps})"
-        )
 
-        checkpoint: Checkpoint | None = self.checkpoint_manager.get_checkpoint()
+        checkpoint: Checkpoint | None = None
         global_step = 0
         start_epoch = 0
         start_micro_step_in_epoch = 0
-        if checkpoint and self._is_checkpoint_compatible(checkpoint):
-            metadata = checkpoint.metadata or {}
-            global_step = metadata.get("global_step", 0)
-            start_epoch = metadata.get("epoch", 0)
-            start_micro_step_in_epoch = metadata.get("micro_step_in_epoch", 0)
-            self._swanlab_run_id = metadata.get("swanlab_run_id") or None
-            logger.info(
-                f"Loading checkpoint from step {global_step}, "
-                f"epoch {start_epoch}, micro_step {start_micro_step_in_epoch}"
-            )
-            model.load_state_dict(checkpoint.model_state_dict)
-            if self._is_distributed():
-                dist.barrier()
-        else:
-            logger.info("No checkpoint found, starting from scratch")
+        logger.info("Checkpoint loading is disabled for pretrain, starting from scratch")
 
         if self._is_main_process():
             self._init_swanlab(device, dataset, dataloader, run_id=self._swanlab_run_id)
 
-        backend_state = backend_runtime.prepare(model, checkpoint)
-        model = backend_state.model
-        optimizer = backend_state.optimizer
-        logger.info(f"optimizer: {type(optimizer).__name__}")
-        accumulated_loss = torch.tensor(0.0, device=device)
+        backend_state = self._prepare_backend(model, device, checkpoint)
+        accumulation_steps = self._get_backend_accumulation_steps(backend_state)
+        steps_per_epoch = len(dataloader) // accumulation_steps
+        max_steps = self.args.train.epoch_num * steps_per_epoch
+        logger.info(
+            f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
+            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps})"
+        )
         tokens = (
             self.args.train.batch_size
             * self.args.train.seq_len
@@ -365,8 +144,7 @@ class PreTrainTrainer:
             eval_elapsed_since_log = 0.0
             for epoch in range(start_epoch, self.args.train.epoch_num):
                 self._set_dataloader_epoch(dataloader, epoch)
-                model.train()
-                backend_runtime.zero_grad()
+                self._set_backend_train_mode(backend_state)
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
                 start_time = time.perf_counter()
@@ -377,29 +155,29 @@ class PreTrainTrainer:
                     dataloader, micro_step_offset
                 )
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
-                    lr = self._get_lr(
-                        global_step,
-                        max_steps,
-                    )
-                    backend_runtime.set_learning_rate(lr)
                     x, y = (
                         x.to(device, non_blocking=True),
                         y.to(device, non_blocking=True),
                     )
-                    with backend_runtime.forward_context():
-                        _, loss = model(x, y)
-                    accumulated_loss += backend_runtime.get_log_loss(loss).detach()
-                    backend_runtime.backward(backend_runtime.get_backward_loss(loss))
-
-                    if not backend_runtime.is_optimizer_step(step + 1):
+                    step_result = self._train_backend_batch(
+                        backend_state=backend_state,
+                        x=x,
+                        y=y,
+                        global_step=global_step,
+                        max_steps=max_steps,
+                        micro_step=step + 1,
+                        device=device,
+                    )
+                    if not step_result:
                         continue
-                    grad_norm = backend_runtime.clip_grad_norm(self._get_grad_clip())
-                    backend_runtime.step()
-                    backend_runtime.zero_grad()
+                    grad_norm = (
+                        step_result["grad_norm"]
+                        if step_result["grad_norm"] is not None
+                        else torch.tensor(0.0, device=device)
+                    )
                     global_step += 1
                     self._save_checkpoint_if_needed(
-                        model=model,
-                        optimizer=optimizer,
+                        backend_state=backend_state,
                         global_step=global_step,
                         epoch=epoch,
                         micro_step_in_epoch=step + 1,
@@ -412,30 +190,27 @@ class PreTrainTrainer:
                         self._log_swanlab(
                             {
                                 "train/step": global_step,
-                                "train/loss": accumulated_loss.item(),
+                                "train/loss": step_result["log_loss"].item(),
                                 "train/grad_norm": grad_norm.item(),
-                                "train/lr": lr,
+                                "train/lr": step_result["lr"] or 0.0,
                                 "train/throughput": int(tokens / (elapsed_ms / 1000)),
                             }
                         )
                         start_time = time.perf_counter()
                         eval_elapsed_since_log = 0.0
+                    # eval_elapsed_since_log += self._run_eval_if_needed(
+                    #     model=model,
+                    #     device=device,
+                    #     global_step=global_step,
+                    # )
 
-                    accumulated_loss = torch.tensor(0.0, device=device)
-                    eval_elapsed_since_log += self._run_eval_if_needed(
-                        model=model,
-                        device=device,
-                        global_step=global_step,
-                    )
-
-            self._save_training_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                global_step=global_step,
-                epoch=self.args.train.epoch_num,
-                micro_step_in_epoch=0,
-                dataloader_length=len(dataloader),
-            )
+            # self._save_training_checkpoint(
+            #     backend_state=backend_state,
+            #     global_step=global_step,
+            #     epoch=self.args.train.epoch_num,
+            #     micro_step_in_epoch=0,
+            #     dataloader_length=len(dataloader),
+            # )
 
         finally:
             self._finish_swanlab()
@@ -446,12 +221,7 @@ class PreTrainTrainer:
             if world_size > 1:
                 if torch.cuda.is_available():
                     if self.args.train.backend == "deepspeed":
-                        deepspeed = self._import_deepspeed()
-                        init_distributed = getattr(deepspeed, "init_distributed", None)
-                        if callable(init_distributed):
-                            init_distributed()
-                        else:
-                            dist.init_process_group(backend="nccl")
+                        self._get_deepspeed_runtime()
                     else:
                         dist.init_process_group(backend="nccl")
                 else:
@@ -498,59 +268,67 @@ class PreTrainTrainer:
     def _is_main_process(self) -> bool:
         return self.rank_info["rank"] == 0
 
-    def _build_backend_runtime(
-        self,
-        device: torch.device,
-    ) -> _BaseBackendRuntime:
-        if self.args.train.backend == "deepspeed":
-            return _DeepSpeedBackendRuntime(self, device)
-        return _NaiveBackendRuntime(self, device)
-
-    def _import_deepspeed(self):
-        try:
-            return import_module("deepspeed")
-        except ImportError as exc:
-            raise ImportError(
-                "train.backend=deepspeed but deepspeed is not installed, please install it first."
-            ) from exc
-
-    def _load_deepspeed_config(self) -> dict[str, Any]:
-        config = self.args.train.deepspeed_config
-        if isinstance(config, dict):
-            return dict(config)
-        if not config:
-            raise ValueError("train.deepspeed_config must be configured")
-        config_path = Path(config)
-        if not config_path.exists():
-            raise FileNotFoundError(f"DeepSpeed config file not found: {config_path}")
-        with open(config_path, "r", encoding="utf-8") as handle:
-            loaded_config = json.load(handle)
-        if not isinstance(loaded_config, dict):
-            raise ValueError("DeepSpeed config must be a JSON object")
-        return loaded_config
-
-    def _resolve_gradient_accumulation_steps(self, accumulation_steps: Any) -> int:
-        resolved_steps = int(accumulation_steps or 1)
-        if resolved_steps <= 0:
-            raise ValueError("gradient accumulation steps must be greater than 0")
-        return resolved_steps
-
-    def _get_gradient_accumulation_steps(self) -> int:
-        if self.args.train.backend == "deepspeed":
-            return self._resolve_gradient_accumulation_steps(
-                self._load_deepspeed_config().get("gradient_accumulation_steps", 1)
+    def _get_deepspeed_runtime(self) -> deepspeed_train.DeepSpeedPretrainRuntime:
+        if self.args.train.backend != "deepspeed":
+            raise ValueError(
+                "DeepSpeed runtime is only available when train.backend=deepspeed"
             )
-        return self._resolve_gradient_accumulation_steps(
-            self.args.train.naive_config.get("accumulation_steps", 4)
+        if self._deepspeed_runtime is None:
+            self._deepspeed_runtime = deepspeed_train.DeepSpeedPretrainRuntime(self.args)
+        return self._deepspeed_runtime
+
+    def _prepare_backend(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+        checkpoint: Checkpoint | None,
+    ):
+        if self.args.train.backend == "deepspeed":
+            return self._get_deepspeed_runtime().prepare(model)
+        return naive_train.prepare_backend(self, model, device, checkpoint)
+
+    def _get_backend_accumulation_steps(self, backend_state) -> int:
+        if self.args.train.backend == "deepspeed":
+            return self._get_deepspeed_runtime().get_accumulation_steps()
+        return naive_train.get_accumulation_steps(backend_state)
+
+    def _set_backend_train_mode(self, backend_state) -> None:
+        if self.args.train.backend == "deepspeed":
+            self._get_deepspeed_runtime().set_train_mode()
+            return
+        naive_train.set_train_mode(backend_state)
+
+    def _train_backend_batch(
+        self,
+        backend_state,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        global_step: int,
+        max_steps: int,
+        micro_step: int,
+        device: torch.device,
+    ) -> dict:
+        if self.args.train.backend == "deepspeed":
+            return self._get_deepspeed_runtime().train(
+                x=x,
+                y=y,
+                device=device,
+            )
+        return naive_train.train_batch(
+            self,
+            backend_state=backend_state,
+            x=x,
+            y=y,
+            global_step=global_step,
+            max_steps=max_steps,
+            micro_step=micro_step,
+            device=device,
         )
 
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
         model_config.setdefault("block_size", self.args.train.seq_len)
         return model_config
-
-    def _get_checkpoint_model_name(self) -> str:
-        return self.args.experiment.name or self.args.model.name
 
     def _get_train_dataset_config(self) -> dict:
         dataset_config = dict(self.args.data.train.dataset_config)
@@ -595,18 +373,13 @@ class PreTrainTrainer:
             sampler.set_epoch(epoch)
 
     def _build_optimizer(self, model: torch.nn.Module) -> torch.optim.Optimizer:
-        optimizer_name = self.args.optimizer.name.lower()
-        optimizer_kwargs = {
-            "lr": self.args.train.naive_config.get("learning_rate", 3e-4),
-            "weight_decay": self.args.optimizer.weight_decay,
-            "betas": tuple(self.args.optimizer.betas),
-            "eps": self.args.optimizer.eps,
-        }
-        if optimizer_name == "adamw":
-            return torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
-        if optimizer_name == "adam":
-            return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
-        raise ValueError(f"Unsupported optimizer: {self.args.optimizer.name}")
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=self.args.train.naive_config.get("learning_rate", 3e-4),
+            weight_decay=0.0,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
 
     def _get_grad_clip(self) -> float:
         return float(self.args.train.naive_config.get("grad_clip", 1.0))
@@ -626,25 +399,6 @@ class PreTrainTrainer:
             except StopIteration:
                 return iter(())
         return iterator
-
-    def _maybe_compile_model(
-        self, model: torch.nn.Module, device: torch.device
-    ) -> torch.nn.Module:
-        if not hasattr(torch, "compile"):
-            return model
-        if device.type not in ("cuda", "mps"):
-            return model
-        try:
-            if device.type == "cuda":
-                torch.set_float32_matmul_precision("high")
-            compiled_model = torch.compile(model)
-            logger.info(f"torch.compile enabled on {device.type}")
-            return compiled_model
-        except Exception as exc:
-            logger.warning(
-                f"torch.compile failed on {device.type}, skip compile: {exc}"
-            )
-            return model
 
     def _init_swanlab(
         self,
@@ -700,39 +454,10 @@ class PreTrainTrainer:
         }
         return config
 
-    def _get_lr(self, step: int, max_steps: int) -> float:
-        warmup_steps = self.args.train.naive_config.get("warmup_steps", 10)
-        learning_rate = self.args.train.naive_config.get("learning_rate", 3e-4)
-        if step < warmup_steps:
-            return learning_rate * step / warmup_steps
-        if step > max_steps:
-            return learning_rate * 0.1
-        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return learning_rate * coeff
-
     def _get_dataloader_seed(self) -> int:
         return self.args.data.train.dataloader_config.get(
             "seed", 42 if not self.args.train.seed else self.args.train.seed
         )
-
-    def _is_amp_enabled(self, device: torch.device) -> bool:
-        return device.type == "cuda" and self.args.train.naive_config.get("amp", False)
-
-    def _get_amp_dtype(self) -> torch.dtype:
-        amp_dtype = self.args.train.naive_config.get("amp_dtype", "bf16")
-        if amp_dtype == "bf16":
-            return torch.bfloat16
-        if amp_dtype == "fp16":
-            return torch.float16
-        raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
-
-    def _build_grad_scaler(self, device: torch.device) -> torch.amp.GradScaler | None:
-        if not self._is_amp_enabled(device):
-            return None
-        if self.args.train.naive_config.get("amp_dtype", "bf16") != "fp16":
-            return None
-        return torch.amp.GradScaler("cuda")
 
     def _is_eval_enabled(self) -> bool:
         return self.args.eval.steps > 0
@@ -774,82 +499,19 @@ class PreTrainTrainer:
 
         return time.perf_counter() - eval_start_time if self._is_main_process() else 0.0
 
-    def _get_checkpoint_model_state(self, model: torch.nn.Module) -> dict:
-        # for ddp
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "_orig_mod"):
-            return model._orig_mod.state_dict()
-        return model.state_dict()
-
-    def _get_checkpoint_resume_config(self) -> dict:
-        return {
-            "checkpoint_model_name": self._get_checkpoint_model_name(),
-            "model_arch": self.args.model.name,
-            "backend": self.args.train.backend,
-            "data_strategy": self.args.data.train.data_strategy,
-            "world_size": self.rank_info["world_size"],
-            "training": {
-                "batch_size": self.args.train.batch_size,
-                "seq_len": self.args.train.seq_len,
-                "accumulation_steps": self._get_gradient_accumulation_steps(),
-                "seed": self.args.train.seed,
-            },
-            "optimizer": {
-                "name": self.args.optimizer.name,
-            },
-            "dataloader": {
-                "seed": self._get_dataloader_seed(),
-                "shuffle": self.args.data.train.dataloader_config.get("shuffle", True),
-                "drop_last": self.args.data.train.dataloader_config.get(
-                    "drop_last", False
-                ),
-            },
-        }
-
-    def _is_checkpoint_compatible(self, checkpoint: Checkpoint | None) -> bool:
-        if checkpoint is None:
-            return False
-        metadata = checkpoint.metadata or {}
-        checkpoint_resume_config = metadata.get("resume_config")
-        if checkpoint_resume_config is None:
-            logger.warning("checkpoint is missing resume_config, skip resume")
-            return False
-        current_resume_config = self._get_checkpoint_resume_config()
-        if checkpoint_resume_config == current_resume_config:
-            return True
-        mismatch_keys = []
-        for key, current_value in current_resume_config.items():
-            checkpoint_value = checkpoint_resume_config.get(key)
-            if checkpoint_value != current_value:
-                mismatch_keys.append(key)
-        logger.warning(f"checkpoint config mismatch: {', '.join(mismatch_keys)}")
-        return False
-
-    def _normalize_resume_position(
-        self, epoch: int, micro_step_in_epoch: int, dataloader_length: int
-    ) -> tuple[int, int]:
-        if dataloader_length <= 0:
-            return epoch, micro_step_in_epoch
-        normalized_epoch = epoch + micro_step_in_epoch // dataloader_length
-        normalized_micro_step = micro_step_in_epoch % dataloader_length
-        return normalized_epoch, normalized_micro_step
-
     def _save_checkpoint_if_needed(
         self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        backend_state,
         global_step: int,
         epoch: int,
         micro_step_in_epoch: int,
         dataloader_length: int,
     ) -> None:
-        save_steps = self.args.checkpoint.save_steps
-        if save_steps <= 0 or global_step % save_steps != 0:
+        if self.args.train.backend == "deepspeed":
             return
-        self._save_training_checkpoint(
-            model=model,
-            optimizer=optimizer,
+        naive_train.save_checkpoint_if_needed(
+            self,
+            backend_state=backend_state,
             global_step=global_step,
             epoch=epoch,
             micro_step_in_epoch=micro_step_in_epoch,
@@ -858,33 +520,21 @@ class PreTrainTrainer:
 
     def _save_training_checkpoint(
         self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        backend_state,
         global_step: int,
         epoch: int,
         micro_step_in_epoch: int,
         dataloader_length: int,
     ) -> None:
-        if not self._is_main_process():
+        if self.args.train.backend == "deepspeed":
             return
-        checkpoint_epoch, checkpoint_micro_step_in_epoch = (
-            self._normalize_resume_position(
-                epoch, micro_step_in_epoch, dataloader_length
-            )
-        )
-        self.checkpoint_manager.save_checkpoint(
-            checkpoint=Checkpoint(
-                model_state_dict=self._get_checkpoint_model_state(model),
-                optimizer_state_dict=optimizer.state_dict(),
-                metadata={
-                    "global_step": global_step,
-                    "epoch": checkpoint_epoch,
-                    "micro_step_in_epoch": checkpoint_micro_step_in_epoch,
-                    "resume_config": self._get_checkpoint_resume_config(),
-                    "swanlab_run_id": self._swanlab_run_id,
-                },
-            ),
-            step=global_step,
+        naive_train.save_training_checkpoint(
+            self,
+            backend_state=backend_state,
+            global_step=global_step,
+            epoch=epoch,
+            micro_step_in_epoch=micro_step_in_epoch,
+            dataloader_length=dataloader_length,
         )
 
     def _set_seed(self, seed: int, init_cuda: bool = False) -> None:

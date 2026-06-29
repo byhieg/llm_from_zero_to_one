@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 import json
-import logging
 from pathlib import Path
 from typing import Protocol
 
 import torch
+from logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 COMPILED_MODEL_PREFIX = "_orig_mod."
 
 

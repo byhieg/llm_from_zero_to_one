@@ -1,21 +1,9 @@
-"""
-Production-grade logging module for LLM training.
+"""项目统一日志封装。
 
-Inspired by HuggingFace Transformers, vLLM, and Megatron-LM patterns:
-- Rank-aware: only rank 0 logs by default in distributed training
-- Colorized console output with structured formatting
-- log_once / log_every_n / log_rank utilities
-- File handler support for distributed runs
-- Zero external dependencies (stdlib only)
+仅在标准库 ``logging`` 之上增加两点能力：
 
-Usage:
-    from logger import get_logger, init_logger
-
-    init_logger(level="DEBUG", log_file="train.log")
-    logger = get_logger("train")
-
-    logger.info("Training started")
-    logger.log_rank("Rank %d checkpoint saved", 0, rank=0)
+1. 统一 ``llm.*`` 命名空间，避免各模块各自散落配置。
+2. 控制台支持按分布式 rank 过滤，仅输出指定 rank 的日志。
 """
 
 from __future__ import annotations
@@ -23,9 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
-import time
-from typing import Any, cast
+from typing import cast
 
 _LEVEL_COLORS: dict[int, str] = {
     logging.DEBUG: "\033[36m",  # cyan
@@ -57,6 +43,8 @@ class _PlainFormatter(logging.Formatter):
 
 
 class _RankFilter(logging.Filter):
+    """仅允许目标 rank 的日志通过。"""
+
     def __init__(self, rank: int = 0) -> None:
         super().__init__()
         self.target_rank: int = rank
@@ -65,73 +53,6 @@ class _RankFilter(logging.Filter):
         current_rank = _get_rank()
         record.rank = current_rank  # type: ignore[attr-defined]
         return current_rank == self.target_rank
-
-
-_log_once_set: set[int] = set()
-_log_once_lock = threading.Lock()
-
-_log_every_n_timestamps: dict[int, float] = {}
-_log_every_n_lock = threading.Lock()
-
-
-class NewLogger(logging.Logger):
-    """
-    Drop-in replacement for ``logging.Logger`` with training utilities:
-
-    - ``log_rank(msg, rank)``       — only emit on a specific rank
-    - ``log_once(msg, level)``      — emit exactly once across the entire run
-    - ``log_every_n(msg, n, level)`` — emit at most once every *n* seconds
-    """
-
-    def __init__(self, name: str, level: int = logging.NOTSET) -> None:
-        super().__init__(name, level)
-
-    def log_rank(
-        self,
-        msg: str,
-        *args: Any,
-        rank: int = 0,
-        level: int = logging.INFO,
-        **kwargs: Any,
-    ) -> None:
-        """Log *msg* only when the current process rank equals *rank*."""
-        extra: dict[str, Any] = kwargs.pop("extra", None) or {}
-        extra["rank"] = rank
-        if _get_rank() == rank:
-            self._log(level, msg, args, extra=extra)
-
-    def log_once(
-        self,
-        msg: str,
-        *args: Any,
-        level: int = logging.INFO,
-        **kwargs: Any,
-    ) -> None:
-        """Log *msg* exactly once (identity is the string hash)."""
-        key = hash((self.name, msg))
-        with _log_once_lock:
-            if key in _log_once_set:
-                return
-            _log_once_set.add(key)
-        self._log(level, msg, args, **kwargs)
-
-    def log_every_n(
-        self,
-        msg: str,
-        n: float = 10.0,
-        *args: Any,
-        level: int = logging.INFO,
-        **kwargs: Any,
-    ) -> None:
-        """Log *msg* at most once every *n* seconds."""
-        key = hash((self.name, msg))
-        now = time.monotonic()
-        with _log_every_n_lock:
-            last = _log_every_n_timestamps.get(key, 0.0)
-            if now - last < n:
-                return
-            _log_every_n_timestamps[key] = now
-        self._log(level, msg, args, **kwargs)
 
 
 def _get_rank() -> int:
@@ -164,24 +85,15 @@ def _detect_color_support() -> bool:
 
 _ROOT_NAME = "llm"
 
-_loggers: dict[str, NewLogger] = {}
 _global_handler_configured: bool = False
+NewLogger = logging.Logger
 
 
-def get_logger(name: str = "llm") -> NewLogger:
+def get_logger(name: str = "llm") -> logging.Logger:
+    """获取项目日志对象。"""
+
     full_name = name if name.startswith(_ROOT_NAME) else f"{_ROOT_NAME}.{name}"
-    if full_name in _loggers:
-        return _loggers[full_name]
-
-    logging.setLoggerClass(NewLogger)
-    raw = logging.getLogger(full_name)
-    if isinstance(raw, NewLogger):
-        lg = raw
-    else:
-        raw.__class__ = NewLogger
-        lg = cast(NewLogger, raw)
-    _loggers[full_name] = lg
-    return lg
+    return cast(logging.Logger, logging.getLogger(full_name))
 
 
 def init_logger(
@@ -194,27 +106,7 @@ def init_logger(
     datefmt: str = "%Y-%m-%d %H:%M:%S",
     color: bool | None = None,
 ) -> None:
-    """
-    Configure the root ``"llm"`` logger and all subsequently created loggers.
-
-    Parameters
-    ----------
-    level:
-        Console log level. Accepts ``"DEBUG"``, ``"INFO"``, etc. or int.
-    log_file:
-        Optional path to a log file. All ranks write to this file.
-    log_file_level:
-        Level for the file handler (defaults to *level*).
-    rank:
-        Process rank. Only this rank's messages appear on console.
-        Auto-detected via PyTorch / env vars if ``None``.
-    fmt:
-        Custom format string. Supports ``%(color)s`` / ``%(reset)s`` placeholders.
-    datefmt:
-        Date format string (default ``"%Y-%m-%d %H:%M:%S"``).
-    color:
-        Force color on/off. ``None`` = auto-detect.
-    """
+    """初始化项目根日志器。"""
     global _global_handler_configured
     if _global_handler_configured:
         return
@@ -237,10 +129,11 @@ def init_logger(
 
     root_logger = get_logger("llm")
     root_logger.setLevel(logging.DEBUG)
+    root_logger.propagate = False
 
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(numeric_level)
-    console.addFilter(_RankFilter())
+    console.addFilter(_RankFilter(rank))
     if use_color:
         console.setFormatter(_ColorFormatter(fmt=fmt, datefmt=datefmt))
     else:
@@ -261,15 +154,23 @@ def init_logger(
 
 
 def reset_logger() -> None:
+    """重置项目日志配置，供测试使用。"""
+
     global _global_handler_configured
-    for lg in _loggers.values():
-        lg.handlers.clear()
-    _loggers.clear()
+    logger_dict = logging.Logger.manager.loggerDict
+    llm_logger_names = [
+        name
+        for name in logger_dict
+        if name == _ROOT_NAME or name.startswith(f"{_ROOT_NAME}.")
+    ]
+    for logger_name in [_ROOT_NAME, *llm_logger_names]:
+        current_logger = cast(logging.Logger, logging.getLogger(logger_name))
+        for handler in list(current_logger.handlers):
+            current_logger.removeHandler(handler)
+            handler.close()
+        current_logger.setLevel(logging.NOTSET)
+        current_logger.propagate = True
     _global_handler_configured = False
-    with _log_once_lock:
-        _log_once_set.clear()
-    with _log_every_n_lock:
-        _log_every_n_timestamps.clear()
 
 
 logger = get_logger("llm")

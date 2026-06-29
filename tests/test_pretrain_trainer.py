@@ -5,8 +5,9 @@ import random
 import torch
 import torch.nn as nn
 
+import trainer.pretrain.deepspeed_train as deepspeed_train_module
+import trainer.pretrain.naive_train as naive_train_module
 import trainer.pretrain.pretrain as pretrain_module
-from checkpoint_manager import Checkpoint
 from trainer.common_args import ModelConfig
 from trainer.pretrain.pretrain import PreTrainTrainer, ResumableDistributedSampler
 from trainer.pretrain.pretrain_args import (
@@ -15,7 +16,6 @@ from trainer.pretrain.pretrain_args import (
     PreTrainDataConfig,
     PreTrainEvalConfig,
     PreTrainEvalDataConfig,
-    PreTrainOptimizerConfig,
     PreTrainTrainConfig,
     PreTrainTrainDataConfig,
 )
@@ -96,7 +96,6 @@ def make_pretrain_args(**overrides) -> PreTrainArgs:
                 ),
             ),
         ),
-        optimizer=overrides.pop("optimizer", PreTrainOptimizerConfig()),
     )
     args.experiment.name = "demo-exp"
     for field_name, value in overrides.items():
@@ -194,43 +193,37 @@ def test_build_dataloader_worker_init_fn_is_picklable():
     pickle.dumps(dataloader.worker_init_fn)
 
 
-def test_build_optimizer_supports_adamw_and_adam():
-    adamw_trainer = PreTrainTrainer(
+def test_build_optimizer_uses_default_adamw():
+    trainer = PreTrainTrainer(
         make_pretrain_args(
-            train=PreTrainTrainConfig(naive_config={"learning_rate": 1e-3}),
-            optimizer=PreTrainOptimizerConfig(
-                name="adamw",
-                weight_decay=0.1,
-                betas=[0.8, 0.95],
-                eps=1e-6,
-            ),
-        )
-    )
-    adam_trainer = PreTrainTrainer(
-        make_pretrain_args(
-            train=PreTrainTrainConfig(naive_config={"learning_rate": 5e-4}),
-            optimizer=PreTrainOptimizerConfig(name="adam"),
+            train=PreTrainTrainConfig(naive_config={"learning_rate": 1e-3})
         )
     )
 
-    adamw = adamw_trainer._build_optimizer(DummyModel())
-    adam = adam_trainer._build_optimizer(DummyModel())
+    optimizer = trainer._build_optimizer(DummyModel())
 
-    assert isinstance(adamw, torch.optim.AdamW)
-    assert adamw.defaults["lr"] == 1e-3
-    assert adamw.defaults["weight_decay"] == 0.1
-    assert adamw.defaults["betas"] == (0.8, 0.95)
-    assert adamw.defaults["eps"] == 1e-6
-    assert isinstance(adam, torch.optim.Adam)
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.defaults["lr"] == 1e-3
+    assert optimizer.defaults["weight_decay"] == 0.0
+    assert optimizer.defaults["betas"] == (0.9, 0.999)
+    assert optimizer.defaults["eps"] == 1e-8
 
 
-def test_load_deepspeed_config_supports_dict_and_json(tmp_path):
+def test_load_deepspeed_config_supports_dict_and_json(monkeypatch, tmp_path):
     config = {
         "gradient_accumulation_steps": 2,
         "zero_optimization": {"stage": 2},
     }
     config_path = tmp_path / "deepspeed_config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    class FakeDeepSpeed:
+        def init_distributed(self):
+            return None
+
+    monkeypatch.setattr(
+        deepspeed_train_module, "import_module", lambda name: FakeDeepSpeed()
+    )
 
     path_trainer = PreTrainTrainer(
         make_pretrain_args(
@@ -249,13 +242,12 @@ def test_load_deepspeed_config_supports_dict_and_json(tmp_path):
         )
     )
 
-    assert path_trainer._load_deepspeed_config() == config
-    assert dict_trainer._load_deepspeed_config() == config
+    assert path_trainer._get_deepspeed_runtime().config == str(config_path)
+    assert dict_trainer._get_deepspeed_runtime().config == config
 
 
 def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
     calls = []
-    saved_checkpoints = []
     deepspeed_config = {
         "gradient_accumulation_steps": 2,
         "zero_optimization": {"stage": 2},
@@ -285,25 +277,41 @@ def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
         def get_global_grad_norm(self):
             return 0.5
 
+        def gradient_accumulation_steps(self):
+            return 2
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+        def zero_grad(self):
+            calls.append(("optimizer.zero_grad",))
+
     class FakeDeepSpeed:
+        def init_distributed(self):
+            return None
+
         def initialize(self, **kwargs):
             model_parameters = list(kwargs["model_parameters"])
+            optimizer = FakeOptimizer()
             calls.append(
                 (
                     "deepspeed.initialize",
                     kwargs["config"],
-                    type(kwargs["optimizer"]).__name__,
+                    "optimizer" in kwargs,
                     len(model_parameters),
                 )
             )
             return (
-                FakeEngine(kwargs["model"], kwargs["optimizer"]),
-                kwargs["optimizer"],
+                FakeEngine(kwargs["model"], optimizer),
+                optimizer,
                 None,
                 None,
             )
 
-    monkeypatch.setattr(pretrain_module, "import_module", lambda name: FakeDeepSpeed())
+    monkeypatch.setattr(
+        deepspeed_train_module, "import_module", lambda name: FakeDeepSpeed()
+    )
     monkeypatch.setattr(
         pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
     )
@@ -319,14 +327,7 @@ def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
                 deepspeed_config=str(config_path),
                 naive_config={"learning_rate": 5e-4},
             ),
-            optimizer=PreTrainOptimizerConfig(name="adam"),
         )
-    )
-    monkeypatch.setattr(trainer.checkpoint_manager, "get_checkpoint", lambda: None)
-    monkeypatch.setattr(
-        trainer.checkpoint_manager,
-        "save_checkpoint",
-        lambda checkpoint, step: saved_checkpoints.append((checkpoint, step)),
     )
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
@@ -334,22 +335,137 @@ def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
     monkeypatch.setattr(
         trainer,
-        "_maybe_compile_model",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("deepspeed backend should not compile model here")
+        "_build_optimizer",
+        lambda model: (_ for _ in ()).throw(
+            AssertionError("deepspeed backend should use optimizer from config")
         ),
     )
 
     trainer.run()
 
-    checkpoint, step = saved_checkpoints[0]
     assert calls == [
-        ("deepspeed.initialize", deepspeed_config, "Adam", 2),
+        ("deepspeed.initialize", str(config_path), False, 2),
     ]
-    assert step == 0
-    assert checkpoint.metadata["global_step"] == 0
-    assert checkpoint.metadata["resume_config"]["backend"] == "deepspeed"
-    assert checkpoint.metadata["resume_config"]["training"]["accumulation_steps"] == 2
+
+
+def test_run_delegates_deepspeed_step_and_boundary_to_engine(monkeypatch, tmp_path):
+    calls = []
+    saved_steps = []
+    processed_batches = []
+    dataloader = [
+        (torch.tensor([0]), torch.tensor([0])),
+        (torch.tensor([1]), torch.tensor([1])),
+        (torch.tensor([2]), torch.tensor([2])),
+        (torch.tensor([3]), torch.tensor([3])),
+    ]
+    deepspeed_config = {
+        "gradient_accumulation_steps": 2,
+        "zero_optimization": {"stage": 2},
+    }
+    config_path = tmp_path / "deepspeed_config.json"
+    config_path.write_text(json.dumps(deepspeed_config), encoding="utf-8")
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+    class FakeEngine(nn.Module):
+        def __init__(self, model, optimizer):
+            super().__init__()
+            self.module = model
+            self.optimizer = optimizer
+            self.micro_step = 0
+
+        def forward(self, x, y):
+            return self.module(x, y)
+
+        def backward(self, loss):
+            calls.append(("engine.backward", float(loss.detach().item())))
+            loss.backward()
+
+        def step(self):
+            self.micro_step += 1
+            calls.append(("engine.step", self.micro_step))
+
+        def is_gradient_accumulation_boundary(self):
+            boundary = self.micro_step % 2 == 0
+            calls.append(("engine.boundary", self.micro_step, boundary))
+            return boundary
+
+        def get_global_grad_norm(self):
+            return 0.5
+
+        def gradient_accumulation_steps(self):
+            return 2
+
+    class FakeDeepSpeed:
+        def init_distributed(self):
+            return None
+
+        def initialize(self, **kwargs):
+            optimizer = FakeOptimizer()
+            return (
+                FakeEngine(kwargs["model"], optimizer),
+                optimizer,
+                None,
+                None,
+            )
+
+    monkeypatch.setattr(
+        deepspeed_train_module, "import_module", lambda name: FakeDeepSpeed()
+    )
+    monkeypatch.setattr(
+        pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
+    )
+    monkeypatch.setattr(
+        pretrain_module,
+        "create_model",
+        lambda *args, **kwargs: TrainStepModel(processed_batches),
+    )
+
+    trainer = PreTrainTrainer(
+        make_pretrain_args(
+            train=PreTrainTrainConfig(
+                epoch_num=1,
+                log_steps=100,
+                backend="deepspeed",
+                deepspeed_config=str(config_path),
+            )
+        )
+    )
+    monkeypatch.setattr(trainer, "_init_seed", lambda: None)
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
+    monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
+    monkeypatch.setattr(
+        trainer,
+        "_save_checkpoint_if_needed",
+        lambda **kwargs: saved_steps.append(kwargs["global_step"]),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_run_eval_if_needed",
+        lambda model, device, global_step: 0.0,
+    )
+
+    trainer.run()
+
+    assert processed_batches == [0, 1, 2, 3]
+    assert saved_steps == [1, 2]
+    assert calls == [
+        ("engine.backward", 0.0),
+        ("engine.step", 1),
+        ("engine.boundary", 1, False),
+        ("engine.backward", 0.0),
+        ("engine.step", 2),
+        ("engine.boundary", 2, True),
+        ("engine.backward", 0.0),
+        ("engine.step", 3),
+        ("engine.boundary", 3, False),
+        ("engine.backward", 0.0),
+        ("engine.step", 4),
+        ("engine.boundary", 4, True),
+    ]
 
 
 def test_get_amp_dtype_and_grad_scaler(monkeypatch):
@@ -372,64 +488,42 @@ def test_get_amp_dtype_and_grad_scaler(monkeypatch):
         )
     )
 
-    assert bf16_trainer._get_amp_dtype() == torch.bfloat16
-    assert fp16_trainer._get_amp_dtype() == torch.float16
-    assert bf16_trainer._build_grad_scaler(torch.device("cuda")) is None
-    assert fp16_trainer._build_grad_scaler(torch.device("cpu")) is None
-    assert fp16_trainer._build_grad_scaler(torch.device("cuda")) is not None
+    assert naive_train_module.get_amp_dtype(bf16_trainer.args) == torch.bfloat16
+    assert naive_train_module.get_amp_dtype(fp16_trainer.args) == torch.float16
+    assert naive_train_module.build_grad_scaler(
+        bf16_trainer.args, torch.device("cuda")
+    ) is None
+    assert naive_train_module.build_grad_scaler(
+        fp16_trainer.args, torch.device("cpu")
+    ) is None
+    assert naive_train_module.build_grad_scaler(
+        fp16_trainer.args, torch.device("cuda")
+    ) is not None
     assert calls == ["cuda"]
 
 
-def test_pretrain_trainer_uses_experiment_name_for_checkpoint_manager(monkeypatch):
-    calls = {}
-
-    class FakeCheckpointManager:
-        def __init__(self, checkpoint_config, model_name):
-            calls["checkpoint_dir"] = checkpoint_config.checkpoint_dir
-            calls["model_name"] = model_name
-
-    monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
-
+def test_pretrain_trainer_disables_checkpoint_manager():
     args = make_pretrain_args(
         checkpoint=PreTrainCheckpointConfig(checkpoint_dir="checkpoints/pretrain")
     )
     args.experiment.name = "minimind_61m_pretrain"
     trainer = PreTrainTrainer(args)
 
-    assert trainer.checkpoint_manager is not None
-    assert calls == {
-        "checkpoint_dir": "checkpoints/pretrain",
-        "model_name": "minimind_61m_pretrain",
-    }
+    assert trainer.checkpoint_manager is None
 
 
-def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
+def test_run_builds_optimizer_without_checkpoint_resume(monkeypatch):
     calls = []
-
-    class FakeCheckpointManager:
-        def __init__(self, checkpoint_config, model_name):
-            pass
-
-        def get_checkpoint(self):
-            return None
-
-        def save_checkpoint(self, checkpoint, step):
-            calls.append(("save_checkpoint", step, checkpoint.metadata["epoch"]))
 
     class FakeOptimizer:
         def __init__(self):
             self.param_groups = [{"lr": 0.0}]
-
-        def load_state_dict(self, state_dict):
-            calls.append(("optimizer.load_state_dict", state_dict))
 
         def zero_grad(self):
             pass
 
         def state_dict(self):
             return {"optimizer": "state"}
-
-    monkeypatch.setattr(pretrain_module, "CheckpointManager", FakeCheckpointManager)
     monkeypatch.setattr(
         pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
     )
@@ -439,25 +533,6 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
 
     trainer = PreTrainTrainer(
         make_pretrain_args(train=PreTrainTrainConfig(epoch_num=0))
-    )
-    monkeypatch.setattr(
-        trainer.checkpoint_manager,
-        "get_checkpoint",
-        lambda: Checkpoint(
-            model_state_dict={
-                "linear.weight": torch.ones((2, 4)),
-                "linear.bias": torch.zeros(2),
-            },
-            optimizer_state_dict={
-                "state": {},
-                "param_groups": [{"lr": 1e-3, "params": [0, 1]}],
-            },
-            metadata={
-                "global_step": 7,
-                "resume_config": trainer._get_checkpoint_resume_config(),
-                "swanlab_run_id": "run-321",
-            },
-        ),
     )
 
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
@@ -471,23 +546,16 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
     )
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
     monkeypatch.setattr(
-        trainer,
-        "_maybe_compile_model",
+        naive_train_module,
+        "maybe_compile_model",
         lambda model, device: calls.append(("compile", device.type)) or model,
     )
-
-    original_load_state_dict = DummyModel.load_state_dict
     original_to = DummyModel.to
-
-    def fake_load_state_dict(self, state_dict, *args, **kwargs):
-        calls.append(("model.load_state_dict", sorted(state_dict.keys())))
-        return original_load_state_dict(self, state_dict, *args, **kwargs)
 
     def fake_to(self, device, *args, **kwargs):
         calls.append(("model.to", str(device)))
         return original_to(self, device, *args, **kwargs)
 
-    monkeypatch.setattr(DummyModel, "load_state_dict", fake_load_state_dict)
     monkeypatch.setattr(DummyModel, "to", fake_to)
     monkeypatch.setattr(
         trainer,
@@ -500,16 +568,13 @@ def test_run_builds_optimizer_before_loading_optimizer_state(monkeypatch):
 
     trainer.run()
 
-    assert calls[0] == ("model.load_state_dict", ["linear.bias", "linear.weight"])
-    assert calls[1] == ("init_swanlab", "run-321")
-    assert calls[2][0] == "model.to"
-    assert calls[3] == ("build_optimizer", calls[2][1])
-    assert calls[4][0] == "optimizer.load_state_dict"
-    assert calls[5] == ("compile", calls[2][1])
-    assert calls[6] == ("save_checkpoint", 7, 0)
+    assert calls[0] == ("init_swanlab", None)
+    assert calls[1][0] == "model.to"
+    assert calls[2] == ("build_optimizer", calls[1][1])
+    assert calls[3] == ("compile", calls[1][1])
 
 
-def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
+def test_run_starts_from_scratch_when_checkpoint_is_disabled(monkeypatch):
     processed_batches = []
     dataloader = [
         (torch.tensor([0]), torch.tensor([0])),
@@ -552,35 +617,20 @@ def test_run_skips_consumed_micro_batches_when_resuming(monkeypatch):
             ),
         )
     )
-    monkeypatch.setattr(
-        trainer.checkpoint_manager,
-        "get_checkpoint",
-        lambda: Checkpoint(
-            model_state_dict=TrainStepModel([]).state_dict(),
-            optimizer_state_dict={},
-            metadata={
-                "global_step": 3,
-                "epoch": 0,
-                "micro_step_in_epoch": 2,
-                "resume_config": trainer._get_checkpoint_resume_config(),
-            },
-        ),
-    )
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
     monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
-    monkeypatch.setattr(trainer, "_maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(naive_train_module, "maybe_compile_model", lambda model, device: model)
     monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
     monkeypatch.setattr(trainer, "_save_checkpoint_if_needed", lambda **kwargs: None)
 
     trainer.run()
 
-    assert processed_batches == [2, 3]
+    assert processed_batches == [0, 1, 2, 3]
 
 
-def test_save_training_checkpoint_persists_resume_position(monkeypatch):
-    saved_checkpoints = []
+def test_save_training_checkpoint_is_noop_when_disabled():
     trainer = PreTrainTrainer(
         make_pretrain_args(
             checkpoint=PreTrainCheckpointConfig(
@@ -590,38 +640,24 @@ def test_save_training_checkpoint_persists_resume_position(monkeypatch):
     )
     model = DummyModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-
-    monkeypatch.setattr(
-        trainer.checkpoint_manager,
-        "save_checkpoint",
-        lambda checkpoint, step: saved_checkpoints.append((checkpoint, step)),
+    backend_state = naive_train_module.NaiveBackendState(
+        model=model,
+        optimizer=optimizer,
+        grad_scaler=None,
+        accumulation_steps=1,
     )
     trainer._swanlab_run_id = "run-789"
 
     trainer._save_training_checkpoint(
-        model=model,
-        optimizer=optimizer,
+        backend_state=backend_state,
         global_step=6,
         epoch=0,
         micro_step_in_epoch=4,
         dataloader_length=4,
     )
 
-    checkpoint, step = saved_checkpoints[0]
 
-    assert step == 6
-    assert checkpoint.metadata["global_step"] == 6
-    assert checkpoint.metadata["epoch"] == 1
-    assert checkpoint.metadata["micro_step_in_epoch"] == 0
-    assert (
-        checkpoint.metadata["resume_config"] == trainer._get_checkpoint_resume_config()
-    )
-    assert checkpoint.metadata["swanlab_run_id"] == "run-789"
-
-
-def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
-    saved_checkpoints = []
-
+def test_run_does_not_save_final_checkpoint_when_disabled(monkeypatch):
     class FakeOptimizer:
         def __init__(self):
             self.param_groups = [{"lr": 0.0}]
@@ -647,27 +683,14 @@ def test_run_saves_final_checkpoint_even_without_updates(monkeypatch):
             ),
         )
     )
-    monkeypatch.setattr(
-        trainer.checkpoint_manager,
-        "save_checkpoint",
-        lambda checkpoint, step: saved_checkpoints.append((checkpoint, step)),
-    )
-    monkeypatch.setattr(trainer.checkpoint_manager, "get_checkpoint", lambda: None)
     monkeypatch.setattr(trainer, "_init_seed", lambda: None)
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
     monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
-    monkeypatch.setattr(trainer, "_maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(naive_train_module, "maybe_compile_model", lambda model, device: model)
     monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
 
     trainer.run()
-
-    checkpoint, step = saved_checkpoints[0]
-    assert len(saved_checkpoints) == 1
-    assert step == 0
-    assert checkpoint.metadata["global_step"] == 0
-    assert checkpoint.metadata["epoch"] == 0
-    assert checkpoint.metadata["micro_step_in_epoch"] == 0
 
 
 def test_get_dataloader_seed_and_set_seed():

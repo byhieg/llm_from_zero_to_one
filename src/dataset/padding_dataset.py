@@ -9,6 +9,8 @@ logger = get_logger(__name__)
 
 
 class PretrainPaddingDataset(Dataset):
+    """训练阶段使用的 padding 数据集。"""
+
     def __init__(
         self,
         tokenizer: TokenizersBackend,
@@ -22,6 +24,7 @@ class PretrainPaddingDataset(Dataset):
         self.col_name = dataset_config.get("col_name", "text")
         self.add_bos_id = dataset_config.get("add_bos_id", False)
         self.add_eos_id = dataset_config.get("add_eos_id", True)
+        self._sample_preview_logged = False
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -59,11 +62,15 @@ class PretrainPaddingDataset(Dataset):
             pad_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         if len(ids) < self.max_seq + 1:
             ids = ids + [pad_token_id] * (self.max_seq + 1 - len(ids))
-        if index == 0:
-            logger.log_once(f"sample: {sample[self.col_name]}")
-            logger.log_once(
-                f"ids: {ids},bos_token_id:{self.tokenizer.bos_token_id},eos_token_id:{self.tokenizer.eos_token_id}"
+        if index == 0 and not self._sample_preview_logged:
+            logger.info("sample: %s", sample[self.col_name])
+            logger.info(
+                "ids: %s,bos_token_id:%s,eos_token_id:%s",
+                ids,
+                self.tokenizer.bos_token_id,
+                self.tokenizer.eos_token_id,
             )
+            self._sample_preview_logged = True
         ids_tensor = torch.tensor(ids, dtype=torch.long)
         x = ids_tensor[:-1]
         y = ids_tensor[1:].clone()

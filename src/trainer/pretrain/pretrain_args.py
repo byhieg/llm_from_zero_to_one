@@ -70,16 +70,6 @@ class PreTrainDataConfig:
 
 
 @dataclass
-class PreTrainOptimizerConfig:
-    """预训练 optimizer 模块配置。"""
-
-    name: str = "adamw"
-    weight_decay: float = 0.0
-    betas: list[float] = field(default_factory=lambda: [0.9, 0.999])
-    eps: float = 1e-8
-
-
-@dataclass
 class PreTrainArgs(TrainingArgs):
     """预训练模式配置。"""
 
@@ -91,7 +81,6 @@ class PreTrainArgs(TrainingArgs):
         default_factory=PreTrainCheckpointConfig
     )
     data: PreTrainDataConfig = field(default_factory=PreTrainDataConfig)
-    optimizer: PreTrainOptimizerConfig = field(default_factory=PreTrainOptimizerConfig)
 
     def set_mode(self, mode: str) -> None:
         """同步 experiment.mode。"""
@@ -110,16 +99,15 @@ class PreTrainArgs(TrainingArgs):
             "eval": asdict(self.eval),
             "checkpoint": asdict(self.checkpoint),
             "data": asdict(self.data),
-            "optimizer": asdict(self.optimizer),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PreTrainArgs":
-        """从 YAML 字典构造预训练配置，并兼容旧结构。"""
+        """从 YAML 字典构造预训练配置。"""
 
-        normalized = cls._normalize_input(data)
-        experiment_dict = normalized.get("experiment", {})
+        experiment_dict = data.get("experiment", {})
         swanlab_dict = experiment_dict.get("swanlab", {})
+        data_dict = data.get("data", {})
 
         return cls(
             experiment=ExperimentConfig(
@@ -131,118 +119,15 @@ class PreTrainArgs(TrainingArgs):
                     tags=list(swanlab_dict.get("tags", [])),
                 ),
             ),
-            model=ModelConfig(**normalized.get("model", {})),
-            train=PreTrainTrainConfig(**normalized.get("train", {})),
-            eval=PreTrainEvalConfig(**normalized.get("eval", {})),
-            checkpoint=PreTrainCheckpointConfig(**normalized.get("checkpoint", {})),
+            model=ModelConfig(**data.get("model", {})),
+            train=PreTrainTrainConfig(**data.get("train", {})),
+            eval=PreTrainEvalConfig(**data.get("eval", {})),
+            checkpoint=PreTrainCheckpointConfig(**data.get("checkpoint", {})),
             data=PreTrainDataConfig(
-                train=PreTrainTrainDataConfig(
-                    **normalized.get("data", {}).get("train", {})
-                ),
-                eval=PreTrainEvalDataConfig(
-                    **normalized.get("data", {}).get("eval", {})
-                ),
+                train=PreTrainTrainDataConfig(**data_dict.get("train", {})),
+                eval=PreTrainEvalDataConfig(**data_dict.get("eval", {})),
             ),
-            optimizer=PreTrainOptimizerConfig(**normalized.get("optimizer", {})),
         )
-
-    @classmethod
-    def _normalize_input(cls, data: dict[str, Any]) -> dict[str, Any]:
-        normalized = dict(data)
-
-        experiment_dict = dict(normalized.get("experiment", {}))
-        if "mode" in experiment_dict:
-            experiment_dict["mode"] = experiment_dict["mode"]
-        if "name" in normalized and "name" not in experiment_dict:
-            experiment_dict["name"] = normalized.pop("name")
-        legacy_swanlab = normalized.pop("swanlab", None)
-        if legacy_swanlab is not None and "swanlab" not in experiment_dict:
-            experiment_dict["swanlab"] = legacy_swanlab
-        if {
-            "enabled",
-            "project",
-            "experiment_name",
-            "tags",
-        } & experiment_dict.keys():
-            experiment_dict = {
-                "mode": experiment_dict.get("mode", ""),
-                "name": experiment_dict.get(
-                    "name", experiment_dict.get("experiment_name", "")
-                ),
-                "swanlab": {
-                    "enabled": experiment_dict.get("enabled", False),
-                    "project": experiment_dict.get("project", "llm-training"),
-                    "tags": list(experiment_dict.get("tags", [])),
-                },
-            }
-        normalized["experiment"] = experiment_dict
-
-        if "training" in normalized and "train" not in normalized:
-            normalized["train"] = normalized.pop("training")
-
-        train_dict = dict(normalized.get("train", {}))
-        legacy_naive_keys = {
-            "learning_rate",
-            "warmup_steps",
-            "grad_clip",
-            "accumulation_steps",
-            "amp",
-            "amp_dtype",
-        }
-        legacy_naive_config = {
-            key: train_dict.pop(key)
-            for key in list(train_dict.keys())
-            if key in legacy_naive_keys
-        }
-        if legacy_naive_config:
-            train_dict.setdefault("naive_config", {}).update(legacy_naive_config)
-        normalized["train"] = train_dict
-
-        legacy_data = dict(normalized.get("data", {}))
-        if "train" not in legacy_data and (
-            "data_strategy" in legacy_data
-            or "dataset_config" in legacy_data
-            or "dataloader_config" in legacy_data
-        ):
-            legacy_data = {
-                "train": {
-                    "data_strategy": legacy_data.get("data_strategy", "padding"),
-                    "dataset_config": dict(legacy_data.get("dataset_config", {})),
-                    "dataloader_config": dict(legacy_data.get("dataloader_config", {})),
-                },
-                "eval": {"dataset_config": {}},
-            }
-        else:
-            legacy_data = {
-                "train": dict(legacy_data.get("train", {})),
-                "eval": dict(legacy_data.get("eval", {})),
-            }
-
-        eval_dict = dict(normalized.get("eval", {}))
-        legacy_eval_dataset_keys = {
-            "dataset_path",
-            "dataset_name",
-            "data_files",
-            "split",
-            "text_column",
-            "col_name",
-            "tokenizer_path",
-            "add_bos_id",
-            "add_eos_id",
-        }
-        legacy_eval_dataset_config = {
-            key: eval_dict.pop(key)
-            for key in list(eval_dict.keys())
-            if key in legacy_eval_dataset_keys
-        }
-        if legacy_eval_dataset_config:
-            legacy_data.setdefault("eval", {}).setdefault("dataset_config", {}).update(
-                legacy_eval_dataset_config
-            )
-        normalized["data"] = legacy_data
-        normalized["eval"] = eval_dict
-
-        return normalized
 
     def validate(self) -> list[str]:
         """校验预训练配置。"""
@@ -340,21 +225,6 @@ class PreTrainArgs(TrainingArgs):
                 errors.append(
                     "data.eval.dataset_config.tokenizer_path is required when eval.steps > 0"
                 )
-
-        if self.optimizer.weight_decay < 0:
-            errors.append(
-                "optimizer.weight_decay must be non-negative, "
-                f"got {self.optimizer.weight_decay}"
-            )
-        if self.optimizer.name not in ("adamw", "adam"):
-            errors.append(
-                f"optimizer.name must be 'adamw' or 'adam', got '{self.optimizer.name}'"
-            )
-        if len(self.optimizer.betas) != 2:
-            errors.append(
-                "optimizer.betas must contain exactly 2 values, "
-                f"got {self.optimizer.betas}"
-            )
 
         if self.experiment.swanlab.enabled:
             if not self.experiment.swanlab.project:

@@ -2,7 +2,10 @@ import argparse
 from pathlib import Path
 
 from logger import get_logger
-from trainer.train_args import load_args_from_yaml, generate_default_config
+from trainer.train_args import (
+    detect_mode_from_yaml,
+    load_pretrain_args_from_yaml,
+)
 
 logger = get_logger(__name__)
 
@@ -13,24 +16,9 @@ def run():
         "--config",
         type=str,
         required=True,
-        help="Path to YAML config file (YAML must contain 'mode' field)",
-    )
-    parser.add_argument(
-        "--generate-config",
-        action="store_true",
-        help="Generate default config file and exit",
-    )
-    parser.add_argument(
-        "--no-validate",
-        action="store_true",
-        help="Skip config validation",
+        help="Path to YAML config file (mode can be in 'mode' or 'experiment.mode')",
     )
     parsed = parser.parse_args()
-
-    if parsed.generate_config:
-        output_path = generate_default_config("pretrain", parsed.config)
-        logger.info(f"✅ Generated default config: {output_path}")
-        return
 
     config_path = Path(parsed.config)
     if not config_path.exists():
@@ -42,23 +30,19 @@ def run():
 
     logger.info(f"📄 Loading config from: {config_path}")
 
-    args, mode = load_args_from_yaml(
-        config_path=config_path, validate=not parsed.no_validate
-    )
-    logger.info(f"🎯 Running in mode: {mode}")
-    logger.info(f"📋 Loaded args: {args}")
+    mode = detect_mode_from_yaml(config_path)
+    logger.info(f"🎯 Detected mode: {mode}")
 
     if mode == "pretrain":
         from .pretrain import PreTrainTrainer
 
+        args = load_pretrain_args_from_yaml(config_path)
+        logger.info(f"📋 Loaded pretrain args: {args}")
         PreTrainTrainer(args).run()
         return
-    if mode == "eval":
-        from evaluator import PretrainEvaluator
-
-        PretrainEvaluator(args).run()
-        return
-    raise ValueError(f"Unsupported mode: {mode}")
+    raise ValueError(
+        f"Unsupported mode for trainer entrypoint: {mode}. Only 'pretrain' is supported."
+    )
 
 
 if __name__ == "__main__":
