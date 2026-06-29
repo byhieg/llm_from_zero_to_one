@@ -1,3 +1,4 @@
+import json
 import pickle
 import random
 
@@ -221,6 +222,134 @@ def test_build_optimizer_supports_adamw_and_adam():
     assert adamw.defaults["betas"] == (0.8, 0.95)
     assert adamw.defaults["eps"] == 1e-6
     assert isinstance(adam, torch.optim.Adam)
+
+
+def test_load_deepspeed_config_supports_dict_and_json(tmp_path):
+    config = {
+        "gradient_accumulation_steps": 2,
+        "zero_optimization": {"stage": 2},
+    }
+    config_path = tmp_path / "deepspeed_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    path_trainer = PreTrainTrainer(
+        make_pretrain_args(
+            train=PreTrainTrainConfig(
+                backend="deepspeed",
+                deepspeed_config=str(config_path),
+            )
+        )
+    )
+    dict_trainer = PreTrainTrainer(
+        make_pretrain_args(
+            train=PreTrainTrainConfig(
+                backend="deepspeed",
+                deepspeed_config=config,
+            )
+        )
+    )
+
+    assert path_trainer._load_deepspeed_config() == config
+    assert dict_trainer._load_deepspeed_config() == config
+
+
+def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
+    calls = []
+    saved_checkpoints = []
+    deepspeed_config = {
+        "gradient_accumulation_steps": 2,
+        "zero_optimization": {"stage": 2},
+    }
+    config_path = tmp_path / "deepspeed_config.json"
+    config_path.write_text(json.dumps(deepspeed_config), encoding="utf-8")
+
+    class FakeEngine(nn.Module):
+        def __init__(self, model, optimizer):
+            super().__init__()
+            self.module = model
+            self.optimizer = optimizer
+
+        def forward(self, x, y):
+            return self.module(x, y)
+
+        def backward(self, loss):
+            calls.append(("engine.backward", float(loss.detach().item())))
+            loss.backward()
+
+        def step(self):
+            calls.append(("engine.step",))
+
+        def zero_grad(self):
+            calls.append(("engine.zero_grad",))
+
+        def get_global_grad_norm(self):
+            return 0.5
+
+    class FakeDeepSpeed:
+        def initialize(self, **kwargs):
+            model_parameters = list(kwargs["model_parameters"])
+            calls.append(
+                (
+                    "deepspeed.initialize",
+                    kwargs["config"],
+                    type(kwargs["optimizer"]).__name__,
+                    len(model_parameters),
+                )
+            )
+            return (
+                FakeEngine(kwargs["model"], kwargs["optimizer"]),
+                kwargs["optimizer"],
+                None,
+                None,
+            )
+
+    monkeypatch.setattr(pretrain_module, "import_module", lambda name: FakeDeepSpeed())
+    monkeypatch.setattr(
+        pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
+    )
+    monkeypatch.setattr(
+        pretrain_module, "create_model", lambda *args, **kwargs: DummyModel()
+    )
+
+    trainer = PreTrainTrainer(
+        make_pretrain_args(
+            train=PreTrainTrainConfig(
+                epoch_num=0,
+                backend="deepspeed",
+                deepspeed_config=str(config_path),
+                naive_config={"learning_rate": 5e-4},
+            ),
+            optimizer=PreTrainOptimizerConfig(name="adam"),
+        )
+    )
+    monkeypatch.setattr(trainer.checkpoint_manager, "get_checkpoint", lambda: None)
+    monkeypatch.setattr(
+        trainer.checkpoint_manager,
+        "save_checkpoint",
+        lambda checkpoint, step: saved_checkpoints.append((checkpoint, step)),
+    )
+    monkeypatch.setattr(trainer, "_init_seed", lambda: None)
+    monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
+    monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
+    monkeypatch.setattr(
+        trainer,
+        "_maybe_compile_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("deepspeed backend should not compile model here")
+        ),
+    )
+
+    trainer.run()
+
+    checkpoint, step = saved_checkpoints[0]
+    assert calls == [
+        ("deepspeed.initialize", deepspeed_config, "Adam", 2),
+    ]
+    assert step == 0
+    assert checkpoint.metadata["global_step"] == 0
+    assert checkpoint.metadata["resume_config"]["backend"] == "deepspeed"
+    assert checkpoint.metadata["resume_config"]["training"]["accumulation_steps"] == 2
 
 
 def test_get_amp_dtype_and_grad_scaler(monkeypatch):
