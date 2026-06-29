@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from typing import Any, Optional, Type
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
-from trainer.common_args import TrainingArgs, ModelConfig, DataConfig, CheckpointConfig
+from trainer.common_args import ModelConfig, TrainingArgs
 
 
 @dataclass
@@ -28,45 +28,29 @@ class EvalTrainingConfig:
 
 
 @dataclass
+class EvalCheckpointConfig:
+    save_steps: int = 1000
+    checkpoint_dir: str = "checkpoints/pretrain"
+    resume_from_checkpoint: Optional[str] = None
+
+
+@dataclass
 class EvalArgs(TrainingArgs):
+    name: str = ""
     training: EvalTrainingConfig = field(default_factory=EvalTrainingConfig)
-    checkpoint: CheckpointConfig = field(
-        default_factory=lambda: CheckpointConfig(checkpoint_dir="checkpoints/pretrain")
-    )
-    data: DataConfig = field(default_factory=DataConfig)
+    checkpoint: EvalCheckpointConfig = field(default_factory=EvalCheckpointConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "EvalArgs":
-        init_kwargs = {}
-
-        for f in fields(cls):
-            if not f.init:
-                continue
-
-            field_name = f.name
-            field_type = f.type
-
-            if field_name not in data:
-                continue
-
-            value = data[field_name]
-
-            field_type_str = (
-                str(field_type).replace("typing.", "").replace(" ", "").strip("<>")
-            )
-
-            if field_type_str in cls._FIELD_TYPE_MAP:
-                field_class = cls._FIELD_TYPE_MAP[field_type_str]
-                if isinstance(value, dict):
-                    init_kwargs[field_name] = field_class(**value)
-                else:
-                    init_kwargs[field_name] = value
-            else:
-                init_kwargs[field_name] = value
-
-        return cls(**init_kwargs)
+        return cls(
+            name=data.get("name", ""),
+            training=EvalTrainingConfig(**data.get("training", {})),
+            checkpoint=EvalCheckpointConfig(**data.get("checkpoint", {})),
+            eval=EvalConfig(**data.get("eval", {})),
+            model=ModelConfig(**data.get("model", {})),
+        )
 
     def validate(self) -> list[str]:
         errors = []
@@ -93,12 +77,3 @@ class EvalArgs(TrainingArgs):
             errors.append("eval.tokenizer_path is required")
 
         return errors
-
-
-EvalArgs._FIELD_TYPE_MAP = {
-    "EvalTrainingConfig": EvalTrainingConfig,
-    "EvalConfig": EvalConfig,
-    "ModelConfig": ModelConfig,
-    "DataConfig": DataConfig,
-    "CheckpointConfig": CheckpointConfig,
-}

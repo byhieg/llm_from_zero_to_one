@@ -16,7 +16,7 @@ from models import create_model
 import os
 from torch.utils.data import DistributedSampler
 
-from .pretrain_args import PretrainArgs
+from .pretrain_args import PreTrainArgs
 
 logger = get_logger(__name__)
 
@@ -59,8 +59,17 @@ class ResumableDistributedSampler(DistributedSampler):
 
 
 class PreTrainTrainer:
-    def __init__(self, args: PretrainArgs):
+    def __init__(self, args: PreTrainArgs):
         self.args = args
+        self.rank_info = {
+            "world_size": 1,
+            "rank": 0,
+            "local_rank": 0,
+            "local_world_size": 1,
+            "node_rank": 0,
+            "is_distributed": False,
+            "is_multi_node": False,
+        }
         self._swanlab = None
         self._swanlab_run_id: str | None = None
         self._evaluator = None
@@ -75,17 +84,19 @@ class PreTrainTrainer:
         device = self._get_device()
         model = create_model(self.args.model.name, self._get_model_config())
         dataset = create_dataset(
-            data_strategy=self.args.data.data_strategy,
-            dataset_config=self._get_dataset_config(),
+            data_strategy=self.args.data.train.data_strategy,
+            dataset_config=self._get_train_dataset_config(),
         )
 
         dataloader = self._build_dataloader(dataset)
 
-        steps_per_epoch = len(dataloader) // self.args.training.naive_config.get("accumulation_steps", 4)
-        max_steps = self.args.training.epoch_num * steps_per_epoch
+        steps_per_epoch = len(dataloader) // self.args.train.naive_config.get(
+            "accumulation_steps", 4
+        )
+        max_steps = self.args.train.epoch_num * steps_per_epoch
 
         world_size = self.rank_info["world_size"]
-        per_gpu_batch_size = self.args.training.batch_size
+        per_gpu_batch_size = self.args.train.batch_size
         total_batch_size = per_gpu_batch_size * world_size
 
         logger.info(model)
@@ -104,8 +115,8 @@ class PreTrainTrainer:
             f"total batch num: {len(dataloader) * world_size}"
         )
         logger.info(
-            f"total steps num: {max_steps} (epoch_num: {self.args.training.epoch_num}, "
-            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {self.args.training.naive_config.get('accumulation_steps', 4)}, eval_steps: {self.args.eval.steps})"
+            f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
+            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {self.args.train.naive_config.get('accumulation_steps', 4)}, eval_steps: {self.args.eval.steps})"
         )
 
         checkpoint: Checkpoint | None = self.checkpoint_manager.get_checkpoint()
@@ -144,15 +155,15 @@ class PreTrainTrainer:
         logger.info(f"optimizer: {type(optimizer).__name__}")
         accumulated_loss = torch.tensor(0.0, device=device)
         tokens = (
-            self.args.training.batch_size
-            * self.args.training.seq_len
-            * self.args.training.naive_config.get("accumulation_steps", 4)
-            * self.args.training.log_steps
+            self.args.train.batch_size
+            * self.args.train.seq_len
+            * self.args.train.naive_config.get("accumulation_steps", 4)
+            * self.args.train.log_steps
             * self.rank_info["world_size"]
         )
         try:
             eval_elapsed_since_log = 0.0
-            for epoch in range(start_epoch, self.args.training.epoch_num):
+            for epoch in range(start_epoch, self.args.train.epoch_num):
                 self._set_dataloader_epoch(dataloader, epoch)
                 model.train()
                 optimizer.zero_grad()
@@ -178,7 +189,7 @@ class PreTrainTrainer:
                     )
                     should_skip_optimizer_step = (
                         step + 1
-                    ) % self.args.training.naive_config.get("accumulation_steps", 4) != 0
+                    ) % self.args.train.naive_config.get("accumulation_steps", 4) != 0
                     if self._is_amp_enabled(device):
                         with torch.autocast(
                             device_type="cuda",
@@ -187,7 +198,9 @@ class PreTrainTrainer:
                             _, loss = model(x, y)
                     else:
                         _, loss = model(x, y)
-                    loss = loss / self.args.training.naive_config.get("accumulation_steps", 4)
+                    loss = loss / self.args.train.naive_config.get(
+                        "accumulation_steps", 4
+                    )
                     if grad_scaler is not None:
                         grad_scaler.scale(loss).backward()
                     else:
@@ -199,7 +212,8 @@ class PreTrainTrainer:
                     if grad_scaler is not None:
                         grad_scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.args.training.naive_config.get("grad_clip", 1.0)
+                        model.parameters(),
+                        self.args.train.naive_config.get("grad_clip", 1.0),
                     )
                     if grad_scaler is not None:
                         grad_scaler.step(optimizer)
@@ -216,7 +230,7 @@ class PreTrainTrainer:
                         micro_step_in_epoch=step + 1,
                         dataloader_length=len(dataloader),
                     )
-                    if global_step % self.args.training.log_steps == 0:
+                    if global_step % self.args.train.log_steps == 0:
                         elapsed_ms = (
                             time.perf_counter() - start_time - eval_elapsed_since_log
                         ) * 1000
@@ -243,7 +257,7 @@ class PreTrainTrainer:
                 model=model,
                 optimizer=optimizer,
                 global_step=global_step,
-                epoch=self.args.training.epoch_num,
+                epoch=self.args.train.epoch_num,
                 micro_step_in_epoch=0,
                 dataloader_length=len(dataloader),
             )
@@ -303,19 +317,19 @@ class PreTrainTrainer:
 
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
-        model_config.setdefault("block_size", self.args.training.seq_len)
+        model_config.setdefault("block_size", self.args.train.seq_len)
         return model_config
 
     def _get_checkpoint_model_name(self) -> str:
-        return self.args.name or self.args.model.name
+        return self.args.experiment.name or self.args.model.name
 
-    def _get_dataset_config(self) -> dict:
-        dataset_config = dict(self.args.data.dataset_config)
-        dataset_config.setdefault("seq_len", self.args.training.seq_len)
+    def _get_train_dataset_config(self) -> dict:
+        dataset_config = dict(self.args.data.train.dataset_config)
+        dataset_config.setdefault("seq_len", self.args.train.seq_len)
         return dataset_config
 
     def _build_dataloader(self, dataset):
-        dataloader_config = self.args.data.dataloader_config
+        dataloader_config = self.args.data.train.dataloader_config
         dataloader_seed = self._get_dataloader_seed()
 
         num_workers = dataloader_config.get("num_workers", 0)
@@ -336,7 +350,7 @@ class PreTrainTrainer:
 
         return torch.utils.data.DataLoader(
             dataset,
-            batch_size=self.args.training.batch_size,
+            batch_size=self.args.train.batch_size,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=dataloader_config.get("pin_memory", False),
@@ -354,7 +368,7 @@ class PreTrainTrainer:
     def _build_optimizer(self, model: torch.nn.Module) -> torch.optim.Optimizer:
         optimizer_name = self.args.optimizer.name.lower()
         optimizer_kwargs = {
-            "lr": self.args.training.naive_config.get("learning_rate", 3e-4),
+            "lr": self.args.train.naive_config.get("learning_rate", 3e-4),
             "weight_decay": self.args.optimizer.weight_decay,
             "betas": tuple(self.args.optimizer.betas),
             "eps": self.args.optimizer.eps,
@@ -407,19 +421,19 @@ class PreTrainTrainer:
         dataloader,
         run_id: str | None = None,
     ) -> None:
-        if not self.args.experiment.enabled:
+        if not self.args.experiment.swanlab.enabled:
             return
         try:
             self._swanlab = import_module("swanlab")
         except ImportError as exc:
             raise ImportError(
-                "experiment.enabled=true but swanlab is not installed, please install it first."
+                "experiment.swanlab.enabled=true but swanlab is not installed, please install it first."
             ) from exc
         run = self._swanlab.init(
-            project=self.args.experiment.project,
-            experiment_name=self.args.experiment.experiment_name,
+            project=self.args.experiment.swanlab.project,
+            experiment_name=self.args.experiment.name,
             config=self._build_swanlab_config(device, dataset, dataloader),
-            tags=self.args.experiment.tags,
+            tags=self.args.experiment.swanlab.tags,
             id=run_id if run_id else None,
             resume="allow" if run_id else None,
         )
@@ -446,7 +460,7 @@ class PreTrainTrainer:
     def _build_swanlab_config(self, device: torch.device, dataset, dataloader) -> dict:
         config = asdict(self.args)
         config.pop("experiment", None)
-        config["data"]["dataset_config"] = self._get_dataset_config()
+        config["data"]["train"]["dataset_config"] = self._get_train_dataset_config()
         config["runtime"] = {
             "dataset_size": len(dataset),
             "dataloader_batches": len(dataloader),
@@ -455,8 +469,8 @@ class PreTrainTrainer:
         return config
 
     def _get_lr(self, step: int, max_steps: int) -> float:
-        warmup_steps = self.args.training.naive_config.get("warmup_steps", 10)
-        learning_rate = self.args.training.naive_config.get("learning_rate", 3e-4)
+        warmup_steps = self.args.train.naive_config.get("warmup_steps", 10)
+        learning_rate = self.args.train.naive_config.get("learning_rate", 3e-4)
         if step < warmup_steps:
             return learning_rate * step / warmup_steps
         if step > max_steps:
@@ -466,15 +480,15 @@ class PreTrainTrainer:
         return learning_rate * coeff
 
     def _get_dataloader_seed(self) -> int:
-        return self.args.data.dataloader_config.get(
-            "seed", 42 if not self.args.training.seed else self.args.training.seed
+        return self.args.data.train.dataloader_config.get(
+            "seed", 42 if not self.args.train.seed else self.args.train.seed
         )
 
     def _is_amp_enabled(self, device: torch.device) -> bool:
-        return device.type == "cuda" and self.args.training.naive_config.get("amp", False)
+        return device.type == "cuda" and self.args.train.naive_config.get("amp", False)
 
     def _get_amp_dtype(self) -> torch.dtype:
-        amp_dtype = self.args.training.naive_config.get("amp_dtype", "bf16")
+        amp_dtype = self.args.train.naive_config.get("amp_dtype", "bf16")
         if amp_dtype == "bf16":
             return torch.bfloat16
         if amp_dtype == "fp16":
@@ -484,7 +498,7 @@ class PreTrainTrainer:
     def _build_grad_scaler(self, device: torch.device) -> torch.amp.GradScaler | None:
         if not self._is_amp_enabled(device):
             return None
-        if self.args.training.amp_dtype != "fp16":
+        if self.args.train.naive_config.get("amp_dtype", "bf16") != "fp16":
             return None
         return torch.amp.GradScaler("cuda")
 
@@ -540,21 +554,25 @@ class PreTrainTrainer:
         return {
             "checkpoint_model_name": self._get_checkpoint_model_name(),
             "model_arch": self.args.model.name,
-            "data_strategy": self.args.data.data_strategy,
+            "data_strategy": self.args.data.train.data_strategy,
             "world_size": self.rank_info["world_size"],
             "training": {
-                "batch_size": self.args.training.batch_size,
-                "seq_len": self.args.training.seq_len,
-                "accumulation_steps": self.args.training.naive_config.get("accumulation_steps", 4),
-                "seed": self.args.training.seed,
+                "batch_size": self.args.train.batch_size,
+                "seq_len": self.args.train.seq_len,
+                "accumulation_steps": self.args.train.naive_config.get(
+                    "accumulation_steps", 4
+                ),
+                "seed": self.args.train.seed,
             },
             "optimizer": {
                 "name": self.args.optimizer.name,
             },
             "dataloader": {
                 "seed": self._get_dataloader_seed(),
-                "shuffle": self.args.data.dataloader_config.get("shuffle", True),
-                "drop_last": self.args.data.dataloader_config.get("drop_last", False),
+                "shuffle": self.args.data.train.dataloader_config.get("shuffle", True),
+                "drop_last": self.args.data.train.dataloader_config.get(
+                    "drop_last", False
+                ),
             },
         }
 
@@ -642,7 +660,7 @@ class PreTrainTrainer:
         _set_process_seed(seed, init_cuda=init_cuda)
 
     def _init_seed(self):
-        seed = self.args.training.seed
+        seed = self.args.train.seed
         self._set_seed(seed, init_cuda=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False

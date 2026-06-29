@@ -1,12 +1,12 @@
 import torch
 
 from checkpoint_manager import Checkpoint, CheckpointManager
-from trainer.train_args import CheckpointConfig
+from evaluator.eval_args import EvalCheckpointConfig
 
 
 def test_get_checkpoint_returns_latest_numeric_checkpoint(tmp_path):
     manager = CheckpointManager(
-        CheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
+        EvalCheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
         "demo-model",
     )
 
@@ -38,7 +38,7 @@ def test_get_checkpoint_returns_latest_numeric_checkpoint(tmp_path):
 
 def test_get_checkpoint_falls_back_to_latest_when_step_missing(tmp_path):
     manager = CheckpointManager(
-        CheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
+        EvalCheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
         "demo-model",
     )
 
@@ -68,7 +68,7 @@ def test_get_checkpoint_falls_back_to_latest_when_step_missing(tmp_path):
 
 def test_get_checkpoint_loads_to_cpu_by_default(tmp_path, monkeypatch):
     manager = CheckpointManager(
-        CheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
+        EvalCheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
         "demo-model",
     )
     checkpoint_dir = manager.checkpoint_dir / "000001"
@@ -98,7 +98,7 @@ def test_get_checkpoint_loads_to_cpu_by_default(tmp_path, monkeypatch):
 
 def test_get_checkpoint_strips_compiled_model_prefix(tmp_path, monkeypatch):
     manager = CheckpointManager(
-        CheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
+        EvalCheckpointConfig(checkpoint_dir=str(tmp_path / "checkpoints")),
         "demo-model",
     )
     checkpoint_dir = manager.checkpoint_dir / "000001"

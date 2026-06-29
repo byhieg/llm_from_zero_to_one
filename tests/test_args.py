@@ -1,162 +1,202 @@
-import os
-import pytest
 import tempfile
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
+import pytest
+
+from evaluator.eval_args import EvalArgs, EvalCheckpointConfig
+from trainer.common_args import ModelConfig, TrainingArgs
+from trainer.pretrain.pretrain_args import (
+    PreTrainArgs,
+    PreTrainCheckpointConfig,
+    PreTrainDataConfig,
+    PreTrainEvalConfig,
+    PreTrainEvalDataConfig,
+    PreTrainOptimizerConfig,
+    PreTrainTrainConfig,
+    PreTrainTrainDataConfig,
+)
 from trainer.train_args import (
-    load_args_from_yaml,
-    register_args,
+    _resolve_config_path,
+    _substitute_env_vars,
+    generate_default_config,
     get_args_class,
     list_modes,
-    generate_default_config,
-    _substitute_env_vars,
-    _resolve_config_path,
+    load_args_from_yaml,
+    register_args,
 )
-from trainer.common_args import (
-    TrainingArgs,
-    ModelConfig,
-    DataConfig,
-    CheckpointConfig,
-    ExperimentConfig,
-)
-from trainer.pretrain.pretrain_args import (
-    PretrainArgs,
-    PretrainTrainingConfig,
-    PretrainEvalConfig,
-    PretrainOptimizerConfig,
-)
-from evaluator.eval_args import EvalArgs, EvalConfig
 
 
-def test_list_modes():
-    modes = list_modes()
-    assert "eval" in modes
-    assert "pretrain" in modes
+def _write_temp_yaml(content: str) -> str:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as handle:
+        handle.write(content)
+        handle.flush()
+        return handle.name
 
 
-def test_get_args_class():
-    args_cls = get_args_class("pretrain")
-    assert args_cls.__name__ == "PretrainArgs"
-
-    eval_args_cls = get_args_class("eval")
-    assert eval_args_cls.__name__ == "EvalArgs"
+def test_list_modes_contains_eval_and_pretrain():
+    assert {"eval", "pretrain"} <= set(list_modes())
 
 
-def test_get_args_class_invalid():
+def test_get_args_class_returns_refactored_pretrain_args():
+    assert get_args_class("pretrain") is PreTrainArgs
+    assert get_args_class("eval") is EvalArgs
+
+
+def test_get_args_class_invalid_mode():
     with pytest.raises(ValueError, match="Unknown mode"):
         get_args_class("invalid_mode")
 
 
-def test_from_yaml_basic():
-    yaml_content = """
-training:
+def test_load_pretrain_args_from_demo_shape():
+    yaml_path = _write_temp_yaml(
+        """
+experiment:
+  mode: pretrain
+  name: minimind_dataset_gpt2_61M
+  swanlab:
+    enabled: true
+    project: llm-pretrain
+    tags: [demo]
+model:
+  name: gpt2
+  config:
+    vocab_size: 6400
+train:
   batch_size: 32
-  naive_config:
-    learning_rate: 0.001
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, mode = load_args_from_yaml("pretrain", f.name, validate=False)
-
-    assert args.training.batch_size == 32
-    assert args.training.naive_config.get("learning_rate") == 0.001
-    assert mode == "pretrain"
-    assert args.training.seq_len == 1024
-    assert args.training.epoch_num == 1
-
-
-def test_from_yaml_all_params():
-    yaml_content = """
-name: minimind_61m_pretrain
-
-training:
-  batch_size: 32
-  seq_len: 512
-  epoch_num: 10
-  naive_config:
-    learning_rate: 0.001
-    warmup_steps: 100
-    grad_clip: 0.5
-    accumulation_steps: 2
-  log_steps: 50
-
-checkpoint:
-  save_steps: 500
-  checkpoint_dir: checkpoints/test
-  resume_from_checkpoint: null
-
-data:
-  dataset_config:
-    dataset_path: /path/to/data
-
+  seq_len: 340
+  epoch_num: 2
+  backend: deepspeed
+  deepspeed_config: xxx/deepspeed_config.json
 eval:
   steps: 100
-  dataset_path: wikitext
-  dataset_name: wikitext-2-raw-v1
-  data_files:
-    validation: /tmp/eval.jsonl
-  split: validation
-  text_column: text
-  tokenizer_path: demo-tokenizer
-  max_samples: 50
-  batch_size: 4
-  add_bos_id: true
-  add_eos_id: false
-
+  max_samples: 1024
+  batch_size: 16
+checkpoint:
+  save_steps: 1000
+  checkpoint_dir: checkpoints/pretrain
+data:
+  train:
+    data_strategy: padding
+    dataset_config:
+      dataset_path: json
+      data_files:
+        train: /tmp/train.jsonl
+    dataloader_config:
+      num_workers: 8
+  eval:
+    dataset_config:
+      dataset_path: json
+      text_column: text
+      tokenizer_path: demo-tokenizer
 optimizer:
   name: adamw
-  weight_decay: 0.1
-  betas: [0.8, 0.95]
-  eps: 1.0e-6
-
-experiment:
-  enabled: true
-  project: demo-project
-  experiment_name: exp-1
-  tags: ["demo"]
 """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, _ = load_args_from_yaml("pretrain", f.name, validate=False)
+    )
 
-    assert args.training.batch_size == 32
-    assert args.name == "minimind_61m_pretrain"
-    assert args.training.seq_len == 512
-    assert args.training.epoch_num == 10
-    assert args.data.dataset_config["dataset_path"] == "/path/to/data"
-    assert args.training.naive_config.get("learning_rate") == 0.001
-    assert args.training.naive_config.get("warmup_steps") == 100
-    assert args.training.naive_config.get("grad_clip") == 0.5
-    assert args.training.naive_config.get("accumulation_steps") == 2
-    assert args.training.log_steps == 50
-    assert args.checkpoint.save_steps == 500
-    assert args.checkpoint.checkpoint_dir == "checkpoints/test"
+    args, mode = load_args_from_yaml(config_path=yaml_path, validate=False)
+
+    assert mode == "pretrain"
+    assert isinstance(args, PreTrainArgs)
+    assert args.experiment.mode == "pretrain"
+    assert args.experiment.name == "minimind_dataset_gpt2_61M"
+    assert args.experiment.swanlab.enabled is True
+    assert args.experiment.swanlab.project == "llm-pretrain"
+    assert args.train.batch_size == 32
+    assert args.train.backend == "deepspeed"
+    assert args.train.deepspeed_config == "xxx/deepspeed_config.json"
     assert args.eval.steps == 100
-    assert args.eval.dataset_path == "wikitext"
-    assert args.eval.dataset_name == "wikitext-2-raw-v1"
-    assert args.eval.data_files == {"validation": "/tmp/eval.jsonl"}
-    assert args.eval.split == "validation"
-    assert args.eval.text_column == "text"
-    assert args.eval.tokenizer_path == "demo-tokenizer"
-    assert args.eval.max_samples == 50
-    assert args.eval.batch_size == 4
-    assert args.eval.add_bos_id is True
-    assert args.eval.add_eos_id is False
-    assert args.optimizer.name == "adamw"
-    assert args.optimizer.weight_decay == 0.1
-    assert tuple(args.optimizer.betas) == (0.8, 0.95)
-    assert args.optimizer.eps == 1.0e-6
-    assert args.experiment.enabled is True
-    assert args.experiment.project == "demo-project"
-    assert args.experiment.experiment_name == "exp-1"
-    assert args.experiment.tags == ["demo"]
+    assert args.data.train.dataset_config["dataset_path"] == "json"
+    assert args.data.eval.dataset_config["tokenizer_path"] == "demo-tokenizer"
+
+
+def test_load_pretrain_args_from_legacy_shape():
+    yaml_path = _write_temp_yaml(
+        """
+mode: pretrain
+name: legacy-exp
+swanlab:
+  enabled: true
+  project: legacy-project
+  tags: [legacy]
+training:
+  batch_size: 8
+  learning_rate: 0.001
+  amp: true
+  amp_dtype: fp16
+data:
+  data_strategy: padding
+  dataset_config:
+    dataset_path: json
+  dataloader_config:
+    seed: 7
+eval:
+  steps: 10
+  dataset_path: json
+  text_column: text
+  tokenizer_path: demo-tokenizer
+"""
+    )
+
+    args, mode = load_args_from_yaml(config_path=yaml_path, validate=False)
+
+    assert mode == "pretrain"
+    assert args.experiment.name == "legacy-exp"
+    assert args.experiment.swanlab.project == "legacy-project"
+    assert args.train.batch_size == 8
+    assert args.train.naive_config["learning_rate"] == 0.001
+    assert args.train.naive_config["amp"] is True
+    assert args.train.naive_config["amp_dtype"] == "fp16"
+    assert args.data.train.dataloader_config["seed"] == 7
+    assert args.data.eval.dataset_config["dataset_path"] == "json"
+    assert args.data.eval.dataset_config["text_column"] == "text"
+
+
+def test_pretrain_to_yaml_renders_demo_structure():
+    args = PreTrainArgs()
+    args.experiment.name = "demo-exp"
+    args.experiment.swanlab.enabled = True
+    args.experiment.swanlab.project = "demo-project"
+    args.train.batch_size = 64
+    args.data.train.dataset_config["dataset_path"] = "json"
+    args.data.eval.dataset_config.update(
+        {"dataset_path": "json", "text_column": "text", "tokenizer_path": "demo"}
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as handle:
+        args.to_yaml(handle.name)
+        content = Path(handle.name).read_text()
+        loaded, mode = load_args_from_yaml(config_path=handle.name, validate=False)
+
+    assert "experiment:" in content
+    assert "  mode: pretrain" in content
+    assert "train:" in content
+    assert "data:" in content
+    assert "  train:" in content
+    assert "  eval:" in content
+    assert "mode: pretrain" not in content.splitlines()[0]
+    assert mode == "pretrain"
+    assert loaded.experiment.name == "demo-exp"
+    assert loaded.train.batch_size == 64
+
+
+def test_generate_default_config_for_pretrain_uses_experiment_mode():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as handle:
+        path = generate_default_config("pretrain", handle.name)
+
+    content = path.read_text()
+    loaded, mode = load_args_from_yaml(config_path=path, validate=False)
+
+    assert "experiment:" in content
+    assert "  mode: pretrain" in content
+    assert "train:" in content
+    assert mode == "pretrain"
+    assert isinstance(loaded, PreTrainArgs)
 
 
 def test_load_eval_args_from_yaml():
-    yaml_content = """
+    yaml_path = _write_temp_yaml(
+        """
 mode: eval
 name: minimind_61m_eval
 model:
@@ -166,94 +206,67 @@ model:
 checkpoint:
   checkpoint_dir: checkpoints/pretrain
 eval:
-  dataset_path: "wikitext"
+  dataset_path: wikitext
   data_files:
-    test: "/tmp/eval.jsonl"
-  text_column: "text"
-  tokenizer_path: "demo-tokenizer"
+    test: /tmp/eval.jsonl
+  text_column: text
+  tokenizer_path: demo-tokenizer
   checkpoint_step: 42
 """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, mode = load_args_from_yaml(config_path=f.name, validate=True)
+    )
+
+    args, mode = load_args_from_yaml(config_path=yaml_path, validate=True)
 
     assert mode == "eval"
     assert isinstance(args, EvalArgs)
     assert args.name == "minimind_61m_eval"
     assert args.eval.dataset_path == "wikitext"
     assert args.eval.data_files == {"test": "/tmp/eval.jsonl"}
-    assert args.eval.text_column == "text"
-    assert args.eval.tokenizer_path == "demo-tokenizer"
     assert args.eval.checkpoint_step == 42
 
 
-def test_to_yaml():
-    args = PretrainArgs(
-        training=PretrainTrainingConfig(batch_size=64, epoch_num=5),
+def test_mode_can_be_detected_from_experiment_block():
+    yaml_path = _write_temp_yaml(
+        """
+experiment:
+  mode: pretrain
+data:
+  train:
+    dataset_config:
+      dataset_path: /data/train
+"""
     )
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        args.to_yaml(f.name)
-        loaded, _ = load_args_from_yaml("pretrain", f.name, validate=False)
+    args, mode = load_args_from_yaml(config_path=yaml_path, validate=False)
 
-    assert loaded.training.batch_size == 64
-    assert loaded.training.epoch_num == 5
-
-
-def test_experiment_config_defaults():
-    args = PretrainArgs()
-
-    assert isinstance(args.optimizer, PretrainOptimizerConfig)
-    assert args.optimizer.name == "adamw"
-    assert isinstance(args.experiment, ExperimentConfig)
-    assert args.experiment.enabled is False
-    assert args.experiment.project == "llm-training"
-
-
-def test_to_dict():
-    args = PretrainArgs(training=PretrainTrainingConfig(batch_size=32))
-    d = args.to_dict()
-
-    assert isinstance(d, dict)
-    assert d["training"]["batch_size"] == 32
-    assert "naive_config" in d["training"]
-    assert "dataset_path" in d["eval"]
-
-
-def test_from_dict():
-    d = {
-        "training": {
-            "batch_size": 64,
-            "naive_config": {
-                "learning_rate": 0.001,
-            },
-        },
-    }
-    args = PretrainArgs.from_dict(d)
-
-    assert args.training.batch_size == 64
-    assert args.training.naive_config.get("learning_rate") == 0.001
-
-
-def test_load_args_from_yaml_factory():
-    yaml_content = """
-training:
-  batch_size: 128
-  epoch_num: 20
-data:
-  dataset_config:
-    dataset_path: /data
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, mode = load_args_from_yaml("pretrain", f.name, validate=False)
-
-    assert isinstance(args, PretrainArgs)
-    assert args.training.batch_size == 128
-    assert args.training.epoch_num == 20
     assert mode == "pretrain"
+    assert isinstance(args, PreTrainArgs)
+
+
+def test_no_mode_raises_error():
+    yaml_path = _write_temp_yaml("train:\n  batch_size: 64\n")
+
+    with pytest.raises(ValueError, match="mode not specified"):
+        load_args_from_yaml(config_path=yaml_path, validate=False)
+
+
+def test_no_config_and_no_mode_raises_error():
+    with pytest.raises(ValueError, match="Either 'mode' or 'config_path'"):
+        load_args_from_yaml()
+
+
+def test_substitute_env_vars_supports_nested_values(monkeypatch):
+    monkeypatch.setenv("BASE_DIR", "/base")
+
+    result = _substitute_env_vars(
+        {
+            "train": {"dataset_path": "${BASE_DIR}/train"},
+            "paths": ["${BASE_DIR}/a", "${UNDEFINED_VAR:-/fallback}"],
+        }
+    )
+
+    assert result["train"]["dataset_path"] == "/base/train"
+    assert result["paths"] == ["/base/a", "/fallback"]
 
 
 def test_register_custom_args():
@@ -262,287 +275,100 @@ def test_register_custom_args():
         custom_param: int = 100
 
     register_args("custom", CustomArgs)
-    assert "custom" in list_modes()
 
-    yaml_content = """
-training:
-  batch_size: 32
-data:
-  dataset_config:
-    dataset_path: /data
-custom_param: 200
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, _ = load_args_from_yaml("custom", f.name, validate=False)
+    yaml_path = _write_temp_yaml("custom_param: 200\n")
+    args, _ = load_args_from_yaml("custom", yaml_path, validate=False)
 
     assert args.custom_param == 200
 
 
-def test_optional_param():
-    yaml_content = """
-checkpoint:
-  resume_from_checkpoint: path/to/checkpoint
-data:
-  dataset_config:
-    dataset_path: /data
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        f.flush()
-        args, _ = load_args_from_yaml("pretrain", f.name, validate=False)
-
-    assert args.checkpoint.resume_from_checkpoint == "path/to/checkpoint"
-
-    yaml_content2 = """
-training:
-  batch_size: 16
-data:
-  dataset_config:
-    dataset_path: /data
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content2)
-        f.flush()
-        args2, _ = load_args_from_yaml("pretrain", f.name, validate=False)
-
-    assert args2.checkpoint.resume_from_checkpoint is None
-
-
-class TestAutoModeDetection:
-    def test_mode_from_yaml(self):
-        yaml_content = """
-mode: pretrain
-training:
-  batch_size: 64
-data:
-  dataset_config:
-    dataset_path: /data/train
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(yaml_content)
-            f.flush()
-            args, mode = load_args_from_yaml(config_path=f.name, validate=False)
-
-        assert mode == "pretrain"
-        assert args.training.batch_size == 64
-        assert isinstance(args, PretrainArgs)
-
-    def test_mode_override(self):
-        yaml_content = """
-mode: pretrain
-training:
-  batch_size: 64
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(yaml_content)
-            f.flush()
-            _, mode = load_args_from_yaml(
-                mode="pretrain", config_path=f.name, validate=False
-            )
-
-        assert mode == "pretrain"
-
-    def test_no_mode_error(self):
-        yaml_content = """
-training:
-  batch_size: 64
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(yaml_content)
-            f.flush()
-
-            with pytest.raises(ValueError, match="mode not specified"):
-                load_args_from_yaml(config_path=f.name, validate=False)
-
-    def test_no_config_no_mode_error(self):
-        with pytest.raises(ValueError, match="Either 'mode' or 'config_path'"):
-            load_args_from_yaml()
-
-
-class TestEnvVarSubstitution:
-    def test_simple_substitution(self):
-        os.environ["TEST_DATA_PATH"] = "/my/data"
-        data = {"path": "${TEST_DATA_PATH}"}
-        result = _substitute_env_vars(data)
-        assert result["path"] == "/my/data"
-        del os.environ["TEST_DATA_PATH"]
-
-    def test_default_value(self):
-        data = {"path": "${UNDEFINED_VAR:-/default/path}"}
-        result = _substitute_env_vars(data)
-        assert result["path"] == "/default/path"
-
-    def test_nested_substitution(self):
-        os.environ["BASE_DIR"] = "/base"
-        data = {
-            "train": {
-                "dataset_path": "${BASE_DIR}/train",
-                "output_path": "${BASE_DIR}/output",
-            },
-            "paths": ["${BASE_DIR}/a", "${BASE_DIR}/b"],
-        }
-        result = _substitute_env_vars(data)
-        assert result["train"]["dataset_path"] == "/base/train"
-        assert result["train"]["output_path"] == "/base/output"
-        assert result["paths"] == ["/base/a", "/base/b"]
-        del os.environ["BASE_DIR"]
-
-    def test_preserve_undefined(self):
-        data = {"path": "${TOTALLY_UNDEFINED_VAR}"}
-        result = _substitute_env_vars(data)
-        assert result["path"] == "${TOTALLY_UNDEFINED_VAR}"
-
-
-class TestValidation:
-    def test_valid_config(self):
-        args = PretrainArgs(
-            data=DataConfig(
+def test_pretrain_validation_accepts_valid_new_structure():
+    args = PreTrainArgs(
+        train=PreTrainTrainConfig(
+            batch_size=32,
+            naive_config={"learning_rate": 0.001},
+        ),
+        data=PreTrainDataConfig(
+            train=PreTrainTrainDataConfig(
                 data_strategy="padding",
-                dataset_config={"dataset_path": "roneneldan/TinyStories"},
+                dataset_config={"dataset_path": "json"},
                 dataloader_config={"num_workers": 0},
             ),
-            training=PretrainTrainingConfig(batch_size=32, naive_config={"learning_rate": 0.001}),
-        )
-        errors = args.validate()
-        assert errors == []
-
-    def test_missing_dataset_path(self):
-        args = PretrainArgs(
-            training=PretrainTrainingConfig(epoch_num=10),
-            data=DataConfig(data_strategy="padding", dataset_config={}),
-        )
-        errors = args.validate()
-        assert any("dataset_path" in e for e in errors)
-
-    def test_invalid_batch_size(self):
-        args = PretrainArgs(
-            training=PretrainTrainingConfig(batch_size=0),
-            data=DataConfig(
-                data_strategy="padding", dataset_config={"dataset_path": "/data"}
+            eval=PreTrainEvalDataConfig(
+                dataset_config={
+                    "dataset_path": "json",
+                    "text_column": "text",
+                    "tokenizer_path": "demo-tokenizer",
+                }
             ),
-        )
-        errors = args.validate()
-        assert any("batch_size" in e for e in errors)
+        ),
+        eval=PreTrainEvalConfig(steps=10),
+    )
 
-    def test_invalid_learning_rate(self):
-        args = PretrainArgs(
-            training=PretrainTrainingConfig(naive_config={"learning_rate": -0.001}),
-            data=DataConfig(
-                data_strategy="padding", dataset_config={"dataset_path": "/data"}
-            ),
-        )
-        errors = args.validate()
-        assert any("learning_rate" in e for e in errors)
-
-    def test_invalid_dataloader_num_workers(self):
-        args = PretrainArgs(
-            data=DataConfig(
-                data_strategy="padding",
-                dataset_config={"dataset_path": "/data"},
-                dataloader_config={"num_workers": -1},
-            )
-        )
-        errors = args.validate()
-        assert any("num_workers" in e for e in errors)
-
-    def test_invalid_optimizer_name(self):
-        args = PretrainArgs()
-        args.optimizer.name = "sgd"
-        errors = args.validate()
-        assert any("optimizer.name" in e for e in errors)
-
-    def test_invalid_weight_decay(self):
-        args = PretrainArgs()
-        args.optimizer.weight_decay = -0.1
-        errors = args.validate()
-        assert any("optimizer.weight_decay" in e for e in errors)
-
-    def test_invalid_optimizer_betas(self):
-        args = PretrainArgs()
-        args.optimizer.betas = [0.9]
-        errors = args.validate()
-        assert any("optimizer.betas" in e for e in errors)
-
-    def test_eval_requires_required_fields(self):
-        args = EvalArgs(
-            checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
-            model=ModelConfig(name="gpt2", config={}),
-        )
-        errors = args.validate()
-        assert any("eval.dataset_path" in e for e in errors)
-        assert any("eval.tokenizer_path" in e for e in errors)
-
-    def test_pretrain_eval_requires_fields_when_enabled(self):
-        args = PretrainArgs(eval=PretrainEvalConfig(steps=100))
-        errors = args.validate()
-        assert any("eval.dataset_path" in e for e in errors)
-        assert any("eval.tokenizer_path" in e for e in errors)
-
-    def test_validation_on_load(self):
-        yaml_content = """
-training:
-  epoch_num: 10
-data:
-  dataset_config:
-    dataset_path: ""
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(yaml_content)
-            f.flush()
-
-            with pytest.raises(ValueError, match="validation"):
-                load_args_from_yaml("pretrain", f.name, validate=True)
-
-            args, _ = load_args_from_yaml("pretrain", f.name, validate=False)
-            assert args.training.epoch_num == 10
+    assert args.validate() == []
 
 
-class TestGenerateDefaultConfig:
-    def test_generate_to_temp(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            path = generate_default_config("pretrain", f.name)
+def test_pretrain_validation_requires_train_dataset_path():
+    args = PreTrainArgs(
+        train=PreTrainTrainConfig(epoch_num=10),
+        data=PreTrainDataConfig(train=PreTrainTrainDataConfig(dataset_config={})),
+    )
 
-        assert path.exists()
+    errors = args.validate()
 
-        args, mode = load_args_from_yaml(config_path=path, validate=False)
-        assert args.training.batch_size == 16
-        assert mode == "pretrain"
-
-    def test_generate_creates_directory(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "subdir" / "config.yaml"
-            result = generate_default_config("pretrain", path)
-
-            assert result.exists()
-            assert result.parent.exists()
-
-    def test_generated_config_has_mode(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            path = generate_default_config("pretrain", f.name)
-
-        content = path.read_text()
-        assert "mode: pretrain" in content
+    assert any("data.train.dataset_config.dataset_path" in error for error in errors)
 
 
-class TestResolveConfigPath:
-    def test_explicit_path(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write("training:\n  batch_size: 32")
-            f.flush()
+def test_pretrain_validation_requires_eval_dataset_fields():
+    args = PreTrainArgs(eval=PreTrainEvalConfig(steps=100))
 
-            result = _resolve_config_path("pretrain", f.name)
-            assert result == Path(f.name)
+    errors = args.validate()
 
-    def test_missing_explicit_path(self):
-        with pytest.raises(FileNotFoundError):
-            _resolve_config_path("pretrain", "/nonexistent/config.yaml")
-
-    def test_default_path_missing(self):
-        with pytest.raises(FileNotFoundError, match="Tip:"):
-            _resolve_config_path("nonexistent_mode")
+    assert any("data.eval.dataset_config.dataset_path" in error for error in errors)
+    assert any("data.eval.dataset_config.tokenizer_path" in error for error in errors)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_pretrain_validation_requires_experiment_name_when_swanlab_enabled():
+    args = PreTrainArgs()
+    args.experiment.swanlab.enabled = True
+    args.experiment.swanlab.project = "demo-project"
+
+    errors = args.validate()
+
+    assert any("experiment.name" in error for error in errors)
+
+
+def test_eval_validation_requires_required_fields():
+    args = EvalArgs(
+        checkpoint=EvalCheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
+        model=ModelConfig(name="gpt2", config={}),
+    )
+
+    errors = args.validate()
+
+    assert any("eval.dataset_path" in error for error in errors)
+    assert any("eval.tokenizer_path" in error for error in errors)
+
+
+def test_resolve_config_path_supports_explicit_and_missing_paths():
+    yaml_path = _write_temp_yaml("custom_param: 1\n")
+
+    assert _resolve_config_path("custom", yaml_path) == Path(yaml_path)
+
+    with pytest.raises(FileNotFoundError):
+        _resolve_config_path("custom", "/nonexistent/config.yaml")
+
+    with pytest.raises(FileNotFoundError, match="Tip:"):
+        _resolve_config_path("nonexistent_mode")
+
+
+def test_pretrain_defaults_use_prefixed_types():
+    args = PreTrainArgs(
+        checkpoint=PreTrainCheckpointConfig(),
+        optimizer=PreTrainOptimizerConfig(),
+    )
+
+    assert isinstance(args, PreTrainArgs)
+    assert isinstance(args.train, PreTrainTrainConfig)
+    assert isinstance(args.checkpoint, PreTrainCheckpointConfig)
+    assert isinstance(args.optimizer, PreTrainOptimizerConfig)

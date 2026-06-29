@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional, Type
+from typing import Any, Type
 
 import yaml
 
@@ -108,6 +108,8 @@ def load_args_from_yaml(
     data = _substitute_env_vars(data or {})
 
     yaml_mode = data.pop("mode", None)
+    if yaml_mode is None:
+        yaml_mode = data.get("experiment", {}).get("mode")
 
     final_mode = mode or yaml_mode
     if final_mode is None:
@@ -118,6 +120,7 @@ def load_args_from_yaml(
 
     args_cls = get_args_class(final_mode)
     args = args_cls.from_dict(data)
+    args.set_mode(final_mode)
 
     if validate:
         errors = args.validate()
@@ -139,12 +142,12 @@ def generate_default_config(mode: str, output_path: str | Path | None = None) ->
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     default_args = args_cls()
-    data = default_args.to_dict()
-    data["mode"] = mode
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"mode: {mode}\n\n")
-        other_data = {k: v for k, v in data.items() if k != "mode"}
         yaml.dump(
-            other_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+            default_args.to_config_dict(mode=mode),
+            f,
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
         )
     return out_path

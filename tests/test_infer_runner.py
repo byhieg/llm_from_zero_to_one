@@ -3,12 +3,8 @@ import torch
 from checkpoint_manager import Checkpoint
 import evaluator.checkpoint_evaluator as evaluator_module
 from evaluator import PretrainEvaluator
-from trainer.train_args import (
-    CheckpointConfig,
-    EvalArgs,
-    EvalConfig,
-    ModelConfig,
-)
+from evaluator.eval_args import EvalArgs, EvalCheckpointConfig, EvalConfig
+from trainer.common_args import ModelConfig
 
 
 class DummyTokenizer:
@@ -118,7 +114,7 @@ def test_pretrain_evaluator_loads_checkpoint_and_scores_dataset(monkeypatch):
 
     args = EvalArgs(
         name="minimind_61m_pretrain",
-        checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
+        checkpoint=EvalCheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
         eval=EvalConfig(
             dataset_path="wikitext",
             dataset_name="wikitext-2-raw-v1",
@@ -181,7 +177,7 @@ def test_pretrain_evaluator_can_score_existing_model(monkeypatch):
     )
 
     args = EvalArgs(
-        checkpoint=CheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
+        checkpoint=EvalCheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
         eval=EvalConfig(
             dataset_path="wikitext",
             dataset_name="wikitext-2-raw-v1",

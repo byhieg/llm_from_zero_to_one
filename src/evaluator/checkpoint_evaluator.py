@@ -1,4 +1,5 @@
 import math
+from typing import Any
 
 from datasets import load_dataset
 import torch
@@ -16,7 +17,7 @@ logger = get_logger(__name__)
 
 
 class PretrainEvaluator:
-    def __init__(self, args: EvalArgs):
+    def __init__(self, args: EvalArgs | Any):
         self.args = args
         self.checkpoint_manager = CheckpointManager(
             args.checkpoint, self._get_checkpoint_model_name()
@@ -75,14 +76,38 @@ class PretrainEvaluator:
 
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
-        model_config.setdefault("block_size", self.args.training.seq_len)
+        model_config.setdefault("block_size", self._get_seq_len())
         return model_config
 
     def _get_checkpoint_model_name(self) -> str:
-        return self.args.name or self.args.model.name
+        if hasattr(self.args, "name") and self.args.name:
+            return self.args.name
+        experiment = getattr(self.args, "experiment", None)
+        if experiment is not None and experiment.name:
+            return experiment.name
+        return self.args.model.name
+
+    def _get_seq_len(self) -> int:
+        if hasattr(self.args, "training"):
+            return self.args.training.seq_len
+        return self.args.train.seq_len
 
     def _get_tokenizer_path(self) -> str:
-        return self.args.eval.tokenizer_path
+        return self._get_eval_dataset_config().get("tokenizer_path", "")
+
+    def _get_eval_dataset_config(self) -> dict[str, Any]:
+        if hasattr(self.args, "data") and hasattr(self.args.data, "eval"):
+            return dict(self.args.data.eval.dataset_config)
+        return {
+            "dataset_path": self.args.eval.dataset_path,
+            "dataset_name": self.args.eval.dataset_name,
+            "data_files": self.args.eval.data_files,
+            "split": self.args.eval.split,
+            "text_column": self.args.eval.text_column,
+            "tokenizer_path": self.args.eval.tokenizer_path,
+            "add_bos_id": self.args.eval.add_bos_id,
+            "add_eos_id": self.args.eval.add_eos_id,
+        }
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
@@ -95,22 +120,25 @@ class PretrainEvaluator:
         return self._eval_dataloader
 
     def _build_eval_dataloader(self, tokenizer) -> DataLoader:
+        eval_dataset_config = self._get_eval_dataset_config()
         dataset = load_dataset(
-            self.args.eval.dataset_path,
-            self.args.eval.dataset_name or None,
-            split=self.args.eval.split,
-            data_files=self.args.eval.data_files or None,
+            eval_dataset_config.get("dataset_path"),
+            eval_dataset_config.get("dataset_name") or None,
+            split=eval_dataset_config.get("split", "test"),
+            data_files=eval_dataset_config.get("data_files") or None,
         )
         max_samples = min(self.args.eval.max_samples, len(dataset))
         dataset = dataset.select(range(max_samples))
         eval_dataset = PretrainPaddingDataset(
             tokenizer=tokenizer,
-            max_seq=self.args.training.seq_len,
+            max_seq=self._get_seq_len(),
             dataset=dataset,
             dataset_config={
-                "col_name": self.args.eval.text_column,
-                "add_bos_id": self.args.eval.add_bos_id,
-                "add_eos_id": self.args.eval.add_eos_id,
+                "col_name": eval_dataset_config.get(
+                    "col_name", eval_dataset_config.get("text_column", "text")
+                ),
+                "add_bos_id": eval_dataset_config.get("add_bos_id", False),
+                "add_eos_id": eval_dataset_config.get("add_eos_id", True),
             },
         )
         return DataLoader(

@@ -2,10 +2,9 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+from typing import Protocol
 
 import torch
-
-from trainer.common_args import CheckpointConfig
 
 logger = logging.getLogger(__name__)
 COMPILED_MODEL_PREFIX = "_orig_mod."
@@ -18,10 +17,16 @@ class Checkpoint:
     metadata: dict | None = None
 
 
+class CheckpointConfigProtocol(Protocol):
+    """Checkpoint 配置协议。"""
+
+    checkpoint_dir: str
+
+
 class CheckpointManager:
     METADATA_FILE = "metadata.json"
 
-    def __init__(self, checkpoint_config: CheckpointConfig, model_name: str):
+    def __init__(self, checkpoint_config: CheckpointConfigProtocol, model_name: str):
         self.checkpoint_config = checkpoint_config
         self.checkpoint_dir = checkpoint_config.checkpoint_dir
         if not self.checkpoint_dir:
