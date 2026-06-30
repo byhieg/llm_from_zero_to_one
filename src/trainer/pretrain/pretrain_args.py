@@ -40,9 +40,10 @@ class PreTrainEvalConfig:
 class PreTrainCheckpointConfig:
     """预训练 checkpoint 模块配置。"""
 
-    save_steps: int = 1000
-    checkpoint_dir: str = "checkpoints/pretrain"
-    resume_from_checkpoint: Optional[str] = None
+    save_step: int = -1
+    save_checkpoint_dir: str = None
+    resume_checkpoint_dir: str = None
+    resume_tag: str = None
 
 
 @dataclass

@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 
-from checkpoint_manager import Checkpoint
+from checkpoint_manager import CheckpointManager
 from dataset import create_dataset
 from evaluator.checkpoint_evaluator import PretrainEvaluator
 from logger import get_logger
@@ -75,23 +75,24 @@ class PreTrainTrainer:
         self._swanlab = None
         self._swanlab_run_id: str | None = None
         self._evaluator = None
-        self._deepspeed_runtime: deepspeed_train.DeepSpeedPretrainRuntime | None = None
-        self.checkpoint_manager = None
 
     def run(self) -> None:
         self._init_seed()
         self.rank_info = self._build_distributed()
-        device = self._get_device()
-        model = create_model(self.args.model.name, self._get_model_config())
+
         dataset = create_dataset(
             data_strategy=self.args.data.train.data_strategy,
             dataset_config=self._get_train_dataset_config(),
         )
         dataloader = self._build_dataloader(dataset)
 
+        ################################### 获取全局信息，进行打印 ###############################################
         world_size = self.rank_info["world_size"]
         per_gpu_batch_size = self.args.train.batch_size
         total_batch_size = per_gpu_batch_size * world_size
+
+        self.device = self._get_device()
+        model = create_model(self.args.model.name, self._get_model_config())
         trainable_params = (
             model.count_parameters()
             if hasattr(model, "count_parameters")
@@ -107,7 +108,7 @@ class PreTrainTrainer:
             f"rank={self.rank_info['rank']}, "
             f"local_rank={self.rank_info['local_rank']}"
         )
-        logger.info(f"train device: {device}")
+        logger.info(f"train device: {self.device}")
         logger.info(
             f"batch size: {per_gpu_batch_size} per GPU × {world_size} GPU = {total_batch_size} total"
         )
@@ -116,22 +117,40 @@ class PreTrainTrainer:
             f"total batch num: {len(dataloader) * world_size}"
         )
 
-        checkpoint: Checkpoint | None = None
-        global_step = 0
-        start_epoch = 0
-        start_micro_step_in_epoch = 0
-        logger.info("Checkpoint loading is disabled for pretrain, starting from scratch")
+        ################################### 初始化训练引擎，checkpoint 恢复 ###############################################
+
+        backend_state = self._prepare_backend(model, self.device)
+
+        if self.args.checkpoint.resume_checkpoint_dir:
+            if self.args.train.backend == "deepspeed":
+                load_path, states = self._deepspeed_runtime.load_checkpoint(
+                    self.args.checkpoint.resume_checkpoint_dir,
+                    self.args.checkpoint.resume_tag,
+                )
+                logger.info(f"Checkpoint prepare to resume checkpoint path:{load_path}")
+                global_step = states["global_step"]
+                start_epoch = states["start_epoch"]
+                start_micro_step_in_epoch = states["start_micro_step_in_epoch"]
+                self._swanlab_run_id = states["swanlab_run_id"]
+            else:
+                raise NotImplementedError
+        else:
+            logger.info("current experiment will train without checkpoint")
+            global_step = 0
+            start_epoch = 0
+            start_micro_step_in_epoch = 0
 
         if self._is_main_process():
-            self._init_swanlab(device, dataset, dataloader, run_id=self._swanlab_run_id)
+            self._init_swanlab(
+                self.device, dataset, dataloader, run_id=self._swanlab_run_id
+            )
 
-        backend_state = self._prepare_backend(model, device, checkpoint)
         accumulation_steps = self._get_backend_accumulation_steps(backend_state)
         steps_per_epoch = len(dataloader) // accumulation_steps
         max_steps = self.args.train.epoch_num * steps_per_epoch
         logger.info(
             f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
-            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps})"
+            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps}, save checkpoint step:{self.args.checkpoint.save_step})"
         )
         tokens = (
             self.args.train.batch_size
@@ -156,28 +175,20 @@ class PreTrainTrainer:
                 )
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     x, y = (
-                        x.to(device, non_blocking=True),
-                        y.to(device, non_blocking=True),
+                        x.to(self.device, non_blocking=True),
+                        y.to(self.device, non_blocking=True),
                     )
-                    step_result = self._train_backend_batch(
-                        backend_state=backend_state,
-                        x=x,
-                        y=y,
-                        global_step=global_step,
-                        max_steps=max_steps,
-                        micro_step=step + 1,
-                        device=device,
-                    )
+                    step_result = self._train_backend_batch(x, y)
                     if not step_result:
                         continue
                     grad_norm = (
                         step_result["grad_norm"]
                         if step_result["grad_norm"] is not None
-                        else torch.tensor(0.0, device=device)
+                        else torch.tensor(0.0, device=self.device)
                     )
                     global_step += 1
-                    self._save_checkpoint_if_needed(
-                        backend_state=backend_state,
+                    self._save_checkpoint(
+                        checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
                         global_step=global_step,
                         epoch=epoch,
                         micro_step_in_epoch=step + 1,
@@ -204,24 +215,24 @@ class PreTrainTrainer:
                     #     global_step=global_step,
                     # )
 
-            # self._save_training_checkpoint(
-            #     backend_state=backend_state,
-            #     global_step=global_step,
-            #     epoch=self.args.train.epoch_num,
-            #     micro_step_in_epoch=0,
-            #     dataloader_length=len(dataloader),
-            # )
+            self._save_checkpoint(
+                checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
+                global_step=global_step,
+                epoch=epoch,
+                micro_step_in_epoch=9,
+                dataloader_length=len(dataloader),
+            )
 
         finally:
             self._finish_swanlab()
 
-    def _build_distributed(self):
+    def _build_distributed(self) -> None:
         if not dist.is_initialized():
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             if world_size > 1:
                 if torch.cuda.is_available():
                     if self.args.train.backend == "deepspeed":
-                        self._get_deepspeed_runtime()
+                        self._init_deepspeed()
                     else:
                         dist.init_process_group(backend="nccl")
                 else:
@@ -268,62 +279,38 @@ class PreTrainTrainer:
     def _is_main_process(self) -> bool:
         return self.rank_info["rank"] == 0
 
-    def _get_deepspeed_runtime(self) -> deepspeed_train.DeepSpeedPretrainRuntime:
-        if self.args.train.backend != "deepspeed":
-            raise ValueError(
-                "DeepSpeed runtime is only available when train.backend=deepspeed"
+    def _init_deepspeed(self) -> deepspeed_train.DeepSpeedPretrainRuntime:
+        if getattr(self, "_deepspeed_runtime", None) is None:
+            self._deepspeed_runtime: deepspeed_train.DeepSpeedPretrainRuntime = (
+                deepspeed_train.DeepSpeedPretrainRuntime(self.args)
             )
-        if self._deepspeed_runtime is None:
-            self._deepspeed_runtime = deepspeed_train.DeepSpeedPretrainRuntime(self.args)
         return self._deepspeed_runtime
 
     def _prepare_backend(
         self,
         model: torch.nn.Module,
         device: torch.device,
-        checkpoint: Checkpoint | None,
+        checkpoint: None,
     ):
         if self.args.train.backend == "deepspeed":
-            return self._get_deepspeed_runtime().prepare(model)
+            return self._deepspeed_runtime.prepare(model)
         return naive_train.prepare_backend(self, model, device, checkpoint)
 
     def _get_backend_accumulation_steps(self, backend_state) -> int:
         if self.args.train.backend == "deepspeed":
-            return self._get_deepspeed_runtime().get_accumulation_steps()
+            return self._deepspeed_runtime.get_accumulation_steps()
         return naive_train.get_accumulation_steps(backend_state)
 
     def _set_backend_train_mode(self, backend_state) -> None:
         if self.args.train.backend == "deepspeed":
-            self._get_deepspeed_runtime().set_train_mode()
+            self._deepspeed_runtime.set_train_mode()
             return
         naive_train.set_train_mode(backend_state)
 
-    def _train_backend_batch(
-        self,
-        backend_state,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        global_step: int,
-        max_steps: int,
-        micro_step: int,
-        device: torch.device,
-    ) -> dict:
+    def _train_backend_batch(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> dict:
         if self.args.train.backend == "deepspeed":
-            return self._get_deepspeed_runtime().train(
-                x=x,
-                y=y,
-                device=device,
-            )
-        return naive_train.train_batch(
-            self,
-            backend_state=backend_state,
-            x=x,
-            y=y,
-            global_step=global_step,
-            max_steps=max_steps,
-            micro_step=micro_step,
-            device=device,
-        )
+            return self._deepspeed_runtime.train(x=x, y=y, device=self.device)
+        return naive_train.train_batch(self, x=x, y=y, device=self.device, **kwargs)
 
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
@@ -499,43 +486,29 @@ class PreTrainTrainer:
 
         return time.perf_counter() - eval_start_time if self._is_main_process() else 0.0
 
-    def _save_checkpoint_if_needed(
+    def _save_checkpoint(
         self,
-        backend_state,
+        checkpoint_dir,
         global_step: int,
         epoch: int,
         micro_step_in_epoch: int,
-        dataloader_length: int,
     ) -> None:
         if self.args.train.backend == "deepspeed":
-            return
-        naive_train.save_checkpoint_if_needed(
-            self,
-            backend_state=backend_state,
-            global_step=global_step,
-            epoch=epoch,
-            micro_step_in_epoch=micro_step_in_epoch,
-            dataloader_length=dataloader_length,
-        )
-
-    def _save_training_checkpoint(
-        self,
-        backend_state,
-        global_step: int,
-        epoch: int,
-        micro_step_in_epoch: int,
-        dataloader_length: int,
-    ) -> None:
-        if self.args.train.backend == "deepspeed":
-            return
-        naive_train.save_training_checkpoint(
-            self,
-            backend_state=backend_state,
-            global_step=global_step,
-            epoch=epoch,
-            micro_step_in_epoch=micro_step_in_epoch,
-            dataloader_length=dataloader_length,
-        )
+            state = {
+                "global_step": global_step,
+                "start_epoch": epoch,
+                "start_micro_step_in_epoch": micro_step_in_epoch,
+                "swanlab_run_id": self._swanlab_run_id,
+            }
+            self._deepspeed_runtime.save_checkpoint(checkpoint_dir, state)
+        # naive_train.save_checkpoint_if_needed(
+        #     self,
+        #     backend_state=backend_state,
+        #     global_step=global_step,
+        #     epoch=epoch,
+        #     micro_step_in_epoch=micro_step_in_epoch,
+        #     dataloader_length=dataloader_length,
+        # )
 
     def _set_seed(self, seed: int, init_cuda: bool = False) -> None:
         _set_process_seed(seed, init_cuda=init_cuda)

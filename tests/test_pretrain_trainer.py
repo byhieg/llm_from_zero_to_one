@@ -490,15 +490,18 @@ def test_get_amp_dtype_and_grad_scaler(monkeypatch):
 
     assert naive_train_module.get_amp_dtype(bf16_trainer.args) == torch.bfloat16
     assert naive_train_module.get_amp_dtype(fp16_trainer.args) == torch.float16
-    assert naive_train_module.build_grad_scaler(
-        bf16_trainer.args, torch.device("cuda")
-    ) is None
-    assert naive_train_module.build_grad_scaler(
-        fp16_trainer.args, torch.device("cpu")
-    ) is None
-    assert naive_train_module.build_grad_scaler(
-        fp16_trainer.args, torch.device("cuda")
-    ) is not None
+    assert (
+        naive_train_module.build_grad_scaler(bf16_trainer.args, torch.device("cuda"))
+        is None
+    )
+    assert (
+        naive_train_module.build_grad_scaler(fp16_trainer.args, torch.device("cpu"))
+        is None
+    )
+    assert (
+        naive_train_module.build_grad_scaler(fp16_trainer.args, torch.device("cuda"))
+        is not None
+    )
     assert calls == ["cuda"]
 
 
@@ -524,6 +527,7 @@ def test_run_builds_optimizer_without_checkpoint_resume(monkeypatch):
 
         def state_dict(self):
             return {"optimizer": "state"}
+
     monkeypatch.setattr(
         pretrain_module, "create_dataset", lambda **kwargs: DummyDataset()
     )
@@ -621,7 +625,9 @@ def test_run_starts_from_scratch_when_checkpoint_is_disabled(monkeypatch):
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: dataloader)
     monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
-    monkeypatch.setattr(naive_train_module, "maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(
+        naive_train_module, "maybe_compile_model", lambda model, device: model
+    )
     monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
     monkeypatch.setattr(trainer, "_save_checkpoint_if_needed", lambda **kwargs: None)
 
@@ -687,7 +693,9 @@ def test_run_does_not_save_final_checkpoint_when_disabled(monkeypatch):
     monkeypatch.setattr(trainer, "_build_dataloader", lambda dataset: [])
     monkeypatch.setattr(trainer, "_init_swanlab", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
-    monkeypatch.setattr(naive_train_module, "maybe_compile_model", lambda model, device: model)
+    monkeypatch.setattr(
+        naive_train_module, "maybe_compile_model", lambda model, device: model
+    )
     monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
 
     trainer.run()

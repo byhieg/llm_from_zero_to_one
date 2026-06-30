@@ -79,9 +79,7 @@ def detect_mode_from_yaml(config_path: str | Path) -> str:
             "'experiment.mode: pretrain' to your YAML."
         )
     if mode != "pretrain":
-        raise ValueError(
-            f"Unsupported mode: {mode}. Only 'pretrain' is supported."
-        )
+        raise ValueError(f"Unsupported mode: {mode}. Only 'pretrain' is supported.")
     return mode
 
 

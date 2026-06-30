@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 from importlib import import_module
 from pathlib import Path
-from typing import Any
-
+import deepspeed
 import torch
 
 from .pretrain_args import PreTrainArgs
@@ -15,7 +14,7 @@ class DeepSpeedPretrainRuntime:
         self.args = args
         self.deepspeed = self._import_deepspeed()
         self.config = self._resolve_config()
-        self.engine: torch.nn.Module | None = None
+        self.engine: deepspeed.DeepSpeedEngine | None = None
         self.optimizer = None
         self._accumulated_loss: torch.Tensor | None = None
         if int(os.environ.get("WORLD_SIZE", 1)) > 1:
@@ -33,8 +32,6 @@ class DeepSpeedPretrainRuntime:
         config = self.args.train.deepspeed_config
         if not config:
             raise ValueError("train.deepspeed_config must be configured")
-        if isinstance(config, dict):
-            return config
         config_path = Path(config)
         if not config_path.exists():
             raise FileNotFoundError(f"DeepSpeed config file not found: {config_path}")
@@ -48,7 +45,9 @@ class DeepSpeedPretrainRuntime:
             raise RuntimeError("DeepSpeed runtime engine is not initialized")
         resolved_steps = int(self.engine.gradient_accumulation_steps())
         if resolved_steps <= 0:
-            raise ValueError("DeepSpeed gradient accumulation steps must be greater than 0")
+            raise ValueError(
+                "DeepSpeed gradient accumulation steps must be greater than 0"
+            )
         return resolved_steps
 
     def prepare(self, model: torch.nn.Module) -> "DeepSpeedPretrainRuntime":
@@ -99,9 +98,7 @@ class DeepSpeedPretrainRuntime:
             "lr": self._get_optimizer_learning_rate(),
         }
 
-    def _get_grad_norm(
-        self, device: torch.device
-    ) -> torch.Tensor:
+    def _get_grad_norm(self, device: torch.device) -> torch.Tensor:
         if self.engine is None:
             raise RuntimeError("DeepSpeed runtime engine is not initialized")
         grad_norm_getter = getattr(self.engine, "get_global_grad_norm", None)
@@ -117,3 +114,13 @@ class DeepSpeedPretrainRuntime:
         if not param_groups:
             return None
         return float(param_groups[0].get("lr", 0.0))
+
+    def save_checkpoint(self, checkpoint_dir: str, client_state: any) -> None:
+        self.engine.save_checkpoint(save_dir=checkpoint_dir, client_state=client_state)
+
+    def load_checkpoint(
+        self, resume_checkpoint_dir: str, resume_tag: str
+    ) -> tuple[str, any]:
+        return self.engine.load_checkpoint(
+            load_dir=resume_checkpoint_dir, tag=resume_tag
+        )
