@@ -125,11 +125,11 @@ class PreTrainTrainer:
                     self.args.checkpoint.resume_checkpoint_dir,
                     self.args.checkpoint.resume_tag,
                 )
-                logger.info(f"Checkpoint prepare to resume checkpoint path:{load_path}")
                 global_step = states["global_step"]
                 start_epoch = states["start_epoch"]
                 start_micro_step_in_epoch = states["start_micro_step_in_epoch"]
                 self._swanlab_run_id = states["swanlab_run_id"]
+                logger.info(f"Checkpoint prepare to resume checkpoint path:{load_path},states:{states}")
             else:
                 raise NotImplementedError
         else:
@@ -176,11 +176,15 @@ class PreTrainTrainer:
                 epoch_iterator = self._build_epoch_iterator(
                     dataloader, micro_step_offset
                 )
+                logger.info(f'dataloader len:{len(dataloader)},micro_step_offset:{micro_step_offset}')
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     x, y = (
                         x.to(self.device, non_blocking=True),
                         y.to(self.device, non_blocking=True),
                     )
+                    if step == micro_step_offset:
+                        logger.info(f'save checkpoint,x:{x[0]} micro_step_offset={micro_step_offset}')
+                        return
                     step_result = self._train_backend_batch(x, y)
                     if not step_result:
                         continue
@@ -189,7 +193,7 @@ class PreTrainTrainer:
                         if step_result["grad_norm"] is not None
                         else torch.tensor(0.0, device=self.device)
                     )
-                    global_step += 1
+                    
                     if (
                         self.args.checkpoint.save_step > 0
                         and global_step % self.args.checkpoint.save_step == 0
@@ -213,6 +217,8 @@ class PreTrainTrainer:
                         )
                         start_time = time.perf_counter()
 
+                    global_step += 1
+                    
             self._save_checkpoint(
                 checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
                 global_step=global_step,
@@ -281,6 +287,8 @@ class PreTrainTrainer:
             self._deepspeed_runtime: deepspeed_train.DeepSpeedPretrainRuntime = (
                 deepspeed_train.DeepSpeedPretrainRuntime(self.args)
             )
+            import logging
+            logging.getLogger("deepspeed").setLevel(logging.INFO)
         return self._deepspeed_runtime
 
     def _prepare_backend(
@@ -458,6 +466,8 @@ class PreTrainTrainer:
                 "swanlab_run_id": self._swanlab_run_id,
             }
             self._deepspeed_runtime.save_checkpoint(checkpoint_dir, state, tag)
+            logger.info(f"save checkpoint global_step: {global_step} epoch: {epoch} micro_step_in_epoch:{micro_step_in_epoch} checkpoint_dir:{checkpoint_dir}")
+
         # naive_train.save_checkpoint_if_needed(
         #     self,
         #     backend_state=backend_state,

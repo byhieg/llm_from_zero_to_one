@@ -8,6 +8,8 @@ import torch
 
 from .pretrain_args import PreTrainArgs
 
+from logger import get_logger
+logger = get_logger(__name__)
 
 class DeepSpeedPretrainRuntime:
     def __init__(self, args: PreTrainArgs):
@@ -122,7 +124,8 @@ class DeepSpeedPretrainRuntime:
     ) -> None:
         self.engine.save_checkpoint(
             save_dir=checkpoint_dir, client_state=client_state, tag=tag
-        )
+        )      
+
 
     def load_checkpoint(
         self, resume_checkpoint_dir: str, resume_tag: str
