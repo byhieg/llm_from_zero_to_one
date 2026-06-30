@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "datasets>=4.6.1",
+    "deepspeed>=0.19.2",
     "jaxtyping>=0.3.7",
     "modelscope[full]>=1.35.0",
     "numpy>=2.2.6",
