@@ -106,6 +106,8 @@ class DeepSpeedPretrainRuntime:
             grad_norm = grad_norm_getter()
             if isinstance(grad_norm, torch.Tensor):
                 return grad_norm
+            if grad_norm is None:
+                return torch.tensor(0.0, device=device)
             return torch.tensor(float(grad_norm), device=device)
         return torch.tensor(0.0, device=device)
 

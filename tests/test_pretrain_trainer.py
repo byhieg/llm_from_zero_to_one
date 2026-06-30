@@ -468,6 +468,75 @@ def test_run_delegates_deepspeed_step_and_boundary_to_engine(monkeypatch, tmp_pa
     ]
 
 
+def test_deepspeed_grad_norm_none_falls_back_to_zero(monkeypatch, tmp_path):
+    config = {
+        "gradient_accumulation_steps": 1,
+        "zero_optimization": {"stage": 0},
+    }
+    config_path = tmp_path / "deepspeed_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    class FakeOptimizer:
+        def __init__(self):
+            self.param_groups = [{"lr": 0.0}]
+
+    class FakeEngine(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.optimizer = FakeOptimizer()
+
+        def forward(self, x, y):
+            loss = self.weight * 0 + x.float().mean() * 0
+            return x, loss
+
+        def backward(self, loss):
+            loss.backward()
+
+        def step(self):
+            return None
+
+        def is_gradient_accumulation_boundary(self):
+            return True
+
+        def get_global_grad_norm(self):
+            return None
+
+        def gradient_accumulation_steps(self):
+            return 1
+
+    class FakeDeepSpeed:
+        def init_distributed(self):
+            return None
+
+        def initialize(self, **kwargs):
+            engine = FakeEngine()
+            return engine, engine.optimizer, None, None
+
+    monkeypatch.setattr(
+        deepspeed_train_module, "import_module", lambda name: FakeDeepSpeed()
+    )
+
+    runtime = deepspeed_train_module.DeepSpeedPretrainRuntime(
+        make_pretrain_args(
+            train=PreTrainTrainConfig(
+                backend="deepspeed",
+                deepspeed_config=str(config_path),
+            )
+        )
+    )
+    runtime.prepare(DummyModel())
+
+    result = runtime.train(
+        x=torch.tensor([0]),
+        y=torch.tensor([0]),
+        device=torch.device("cpu"),
+    )
+
+    assert result is not None
+    assert result["grad_norm"].item() == 0.0
+
+
 def test_get_amp_dtype_and_grad_scaler(monkeypatch):
     calls = []
 

@@ -55,6 +55,14 @@ class _RankFilter(logging.Filter):
         return current_rank == self.target_rank
 
 
+class _InjectRankFilter(logging.Filter):
+    """为日志记录补充当前 rank 信息。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.rank = _get_rank()  # type: ignore[attr-defined]
+        return True
+
+
 def _get_rank() -> int:
     try:
         import torch.distributed as dist
@@ -81,6 +89,10 @@ def _detect_color_support() -> bool:
     if not hasattr(sys.stderr, "isatty"):
         return False
     return sys.stderr.isatty()
+
+
+def _get_ranked_log_file_path(log_file: str, rank: int) -> str:
+    return f"{log_file}.rank{rank}"
 
 
 _ROOT_NAME = "llm"
@@ -113,6 +125,7 @@ def init_logger(
 
     if rank is None:
         rank = _get_rank()
+    current_rank = _get_rank()
 
     numeric_level = level if isinstance(level, int) else getattr(logging, level.upper())
     file_level = (
@@ -145,8 +158,12 @@ def init_logger(
             fmt
             or "%(asctime)s | %(levelname)-8s | rank=%(rank)s | %(name)s | %(message)s"
         )
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = logging.FileHandler(
+            _get_ranked_log_file_path(log_file, current_rank),
+            encoding="utf-8",
+        )
         file_handler.setLevel(file_level)
+        file_handler.addFilter(_InjectRankFilter())
         file_handler.setFormatter(_PlainFormatter(fmt=file_fmt, datefmt=datefmt))
         root_logger.addHandler(file_handler)
 

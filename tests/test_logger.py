@@ -4,7 +4,13 @@ from unittest.mock import patch
 
 import pytest
 
-from logger import NewLogger, get_logger, init_logger, reset_logger
+from logger import (
+    NewLogger,
+    _get_ranked_log_file_path,
+    get_logger,
+    init_logger,
+    reset_logger,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,8 +82,9 @@ class TestInitLogger:
         init_logger(level="DEBUG", log_file=str(log_file), color=False)
         lg = get_logger("train")
         lg.info("file output")
-        assert log_file.exists()
-        assert "file output" in log_file.read_text()
+        ranked_log_file = log_file.with_name(f"{log_file.name}.rank0")
+        assert ranked_log_file.exists()
+        assert "file output" in ranked_log_file.read_text()
 
     def test_log_file_level(self, tmp_path):
         log_file = tmp_path / "test.log"
@@ -90,9 +97,21 @@ class TestInitLogger:
         lg = get_logger("train")
         lg.info("console only")
         lg.warning("both")
-        content = log_file.read_text()
+        ranked_log_file = log_file.with_name(f"{log_file.name}.rank0")
+        content = ranked_log_file.read_text()
         assert "console only" not in content
         assert "both" in content
+
+    def test_log_file_writes_to_ranked_file(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch.dict(os.environ, {"RANK": "3"}):
+            init_logger(level="DEBUG", log_file=str(log_file), color=False)
+            lg = get_logger("train")
+            lg.info("ranked output")
+        ranked_log_file = tmp_path / "test.log.rank3"
+        assert ranked_log_file.exists()
+        assert "rank=3" in ranked_log_file.read_text()
+        assert _get_ranked_log_file_path(str(log_file), 3) == str(ranked_log_file)
 
     def test_custom_fmt(self, capsys):
         init_logger(level="INFO", fmt="%(message)s", datefmt="%H", color=False)
