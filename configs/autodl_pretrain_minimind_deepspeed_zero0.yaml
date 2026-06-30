@@ -1,6 +1,6 @@
 experiment:
   mode: pretrain
-  name: minimind_dataset_gpt2_61M_ds_zero0
+  name: minimind_dataset_gpt2_61M_ds_zero2_ckpt_1
   swanlab:
     enabled: true
     project: llm-pretrain
@@ -15,13 +15,13 @@ model:
     n_embd: 768
 
 train:
-  batch_size: 32
+  batch_size: 64
   seq_len: 340
   epoch_num: 2
   log_steps: 100
   seed: 42
   backend: deepspeed
-  deepspeed_config: configs/deepspeed_zero0_autodl_pretrain_minimind.json
+  deepspeed_config: /root/llm_from_zero_to_one/configs/deepspeed_zero0_autodl_pretrain_minimind.json
 
 eval:
   steps: 1000
@@ -30,9 +30,10 @@ eval:
   checkpoint_step: null
 
 checkpoint:
-  save_steps: 1000
-  checkpoint_dir: checkpoints/pretrain
-  resume_from_checkpoint: null
+  save_step: 50
+  save_checkpoint_dir: /root/autodl-tmp/checkpoint
+  resume_checkpoint_dir: /root/autodl-tmp/checkpoint/minimind_dataset_gpt2_61M_ds_zero2_ckpt_1
+  resume_tag: global_step50
 
 data:
   train:
@@ -41,7 +42,7 @@ data:
       dataset_path: json
       dataset_name: ""
       data_files:
-        train: ${AUTODL_PRETRAIN_TRAIN_FILE:-/root/autodl-tmp/pretrain_t2t_mini.jsonl}
+        train: /root/autodl-tmp/pretrain.jsonl
       tokenizer_path: jingyaogong/minimind-3
       split: train
       col_name: text

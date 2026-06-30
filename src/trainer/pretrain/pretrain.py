@@ -16,7 +16,7 @@ from models import create_model
 
 from . import deepspeed_train, naive_train
 from .pretrain_args import PreTrainArgs
-
+from itertools import islice
 logger = get_logger(__name__)
 
 
@@ -53,8 +53,7 @@ class ResumableDistributedSampler(DistributedSampler):
 
     def __iter__(self):
         # 直接复用父类的分片逻辑
-        indices = list(super().__iter__())
-        yield from indices[self.sample_offset :]
+        return islice(super().__iter__(),self.sample_offset,None)
 
 
 class PreTrainTrainer:
@@ -182,9 +181,6 @@ class PreTrainTrainer:
                         x.to(self.device, non_blocking=True),
                         y.to(self.device, non_blocking=True),
                     )
-                    if step == micro_step_offset:
-                        logger.info(f'save checkpoint,x:{x[0]} micro_step_offset={micro_step_offset}')
-                        return
                     step_result = self._train_backend_batch(x, y)
                     if not step_result:
                         continue
@@ -200,7 +196,7 @@ class PreTrainTrainer:
                     ):
                         self._save_checkpoint(
                             checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
-                            global_step=global_step,
+                            global_step=global_step + 1,
                             epoch=epoch,
                             micro_step_in_epoch=step + 1,
                         )
