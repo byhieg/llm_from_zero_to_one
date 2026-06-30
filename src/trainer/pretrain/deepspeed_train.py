@@ -28,7 +28,7 @@ class DeepSpeedPretrainRuntime:
                 "train.backend=deepspeed but deepspeed is not installed, please install it first."
             ) from exc
 
-    def _resolve_config(self) -> str | dict[str, Any]:
+    def _resolve_config(self) -> str | dict[str, any]:
         config = self.args.train.deepspeed_config
         if not config:
             raise ValueError("train.deepspeed_config must be configured")
@@ -77,7 +77,7 @@ class DeepSpeedPretrainRuntime:
         x: torch.Tensor,
         y: torch.Tensor,
         device: torch.device,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, any] | None:
         if self.engine is None:
             raise RuntimeError("DeepSpeed runtime engine is not initialized")
         _, loss = self.engine(x, y)
@@ -117,8 +117,12 @@ class DeepSpeedPretrainRuntime:
             return None
         return float(param_groups[0].get("lr", 0.0))
 
-    def save_checkpoint(self, checkpoint_dir: str, client_state: any) -> None:
-        self.engine.save_checkpoint(save_dir=checkpoint_dir, client_state=client_state)
+    def save_checkpoint(
+        self, checkpoint_dir: str, client_state: any, tag: str | None = None
+    ) -> None:
+        self.engine.save_checkpoint(
+            save_dir=checkpoint_dir, client_state=client_state, tag=tag
+        )
 
     def load_checkpoint(
         self, resume_checkpoint_dir: str, resume_tag: str

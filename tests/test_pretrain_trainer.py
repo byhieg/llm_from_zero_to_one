@@ -77,7 +77,7 @@ def make_pretrain_args(**overrides) -> PreTrainArgs:
         eval=overrides.pop("eval", PreTrainEvalConfig()),
         checkpoint=overrides.pop(
             "checkpoint",
-            PreTrainCheckpointConfig(checkpoint_dir="checkpoints/pretrain"),
+            PreTrainCheckpointConfig(save_checkpoint_dir="checkpoints/pretrain"),
         ),
         data=overrides.pop(
             "data",
@@ -242,8 +242,8 @@ def test_load_deepspeed_config_supports_dict_and_json(monkeypatch, tmp_path):
         )
     )
 
-    assert path_trainer._get_deepspeed_runtime().config == str(config_path)
-    assert dict_trainer._get_deepspeed_runtime().config == config
+    assert path_trainer._init_deepspeed().config == str(config_path)
+    assert dict_trainer._init_deepspeed().config == config
 
 
 def test_run_uses_deepspeed_backend_runtime(monkeypatch, tmp_path):
@@ -439,13 +439,10 @@ def test_run_delegates_deepspeed_step_and_boundary_to_engine(monkeypatch, tmp_pa
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
     monkeypatch.setattr(
         trainer,
-        "_save_checkpoint_if_needed",
-        lambda **kwargs: saved_steps.append(kwargs["global_step"]),
-    )
-    monkeypatch.setattr(
-        trainer,
-        "_run_eval_if_needed",
-        lambda model, device, global_step: 0.0,
+          "_save_checkpoint",
+          lambda checkpoint_dir, global_step, epoch, micro_step_in_epoch, tag=None: (
+              saved_steps.append(global_step) if micro_step_in_epoch != 0 else None
+          ),
     )
 
     trainer.run()
@@ -572,18 +569,6 @@ def test_get_amp_dtype_and_grad_scaler(monkeypatch):
         is not None
     )
     assert calls == ["cuda"]
-
-
-def test_pretrain_trainer_disables_checkpoint_manager():
-    args = make_pretrain_args(
-        checkpoint=PreTrainCheckpointConfig(checkpoint_dir="checkpoints/pretrain")
-    )
-    args.experiment.name = "minimind_61m_pretrain"
-    trainer = PreTrainTrainer(args)
-
-    assert trainer.checkpoint_manager is None
-
-
 def test_run_builds_optimizer_without_checkpoint_resume(monkeypatch):
     calls = []
 
@@ -686,7 +671,7 @@ def test_run_starts_from_scratch_when_checkpoint_is_disabled(monkeypatch):
                 naive_config={"accumulation_steps": 1},
             ),
             checkpoint=PreTrainCheckpointConfig(
-                checkpoint_dir="checkpoints/test-pretrain"
+                save_checkpoint_dir="checkpoints/test-pretrain"
             ),
         )
     )
@@ -698,38 +683,11 @@ def test_run_starts_from_scratch_when_checkpoint_is_disabled(monkeypatch):
         naive_train_module, "maybe_compile_model", lambda model, device: model
     )
     monkeypatch.setattr(trainer, "_build_optimizer", lambda model: FakeOptimizer())
-    monkeypatch.setattr(trainer, "_save_checkpoint_if_needed", lambda **kwargs: None)
+    monkeypatch.setattr(trainer, "_save_checkpoint", lambda *args, **kwargs: None)
 
     trainer.run()
 
     assert processed_batches == [0, 1, 2, 3]
-
-
-def test_save_training_checkpoint_is_noop_when_disabled():
-    trainer = PreTrainTrainer(
-        make_pretrain_args(
-            checkpoint=PreTrainCheckpointConfig(
-                checkpoint_dir="checkpoints/test-pretrain", save_steps=1
-            )
-        )
-    )
-    model = DummyModel()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    backend_state = naive_train_module.NaiveBackendState(
-        model=model,
-        optimizer=optimizer,
-        grad_scaler=None,
-        accumulation_steps=1,
-    )
-    trainer._swanlab_run_id = "run-789"
-
-    trainer._save_training_checkpoint(
-        backend_state=backend_state,
-        global_step=6,
-        epoch=0,
-        micro_step_in_epoch=4,
-        dataloader_length=4,
-    )
 
 
 def test_run_does_not_save_final_checkpoint_when_disabled(monkeypatch):
@@ -754,7 +712,7 @@ def test_run_does_not_save_final_checkpoint_when_disabled(monkeypatch):
         make_pretrain_args(
             train=PreTrainTrainConfig(epoch_num=0),
             checkpoint=PreTrainCheckpointConfig(
-                checkpoint_dir="checkpoints/test-pretrain"
+                save_checkpoint_dir="checkpoints/test-pretrain"
             ),
         )
     )
@@ -852,54 +810,3 @@ def test_init_swanlab_uses_experiment_and_train_data(monkeypatch):
     assert trainer._swanlab_run_id == "run-123"
     assert calls["log"] == [{"train/epoch": 0}]
     assert calls["finished"] is True
-
-
-def test_run_eval_if_needed_logs_metrics(monkeypatch):
-    trainer = PreTrainTrainer(
-        make_pretrain_args(
-            eval=PreTrainEvalConfig(steps=2),
-            data=PreTrainDataConfig(
-                train=PreTrainTrainDataConfig(
-                    data_strategy="padding",
-                    dataset_config={"dataset_path": "demo"},
-                ),
-                eval=PreTrainEvalDataConfig(
-                    dataset_config={
-                        "dataset_path": "json",
-                        "text_column": "text",
-                        "tokenizer_path": "demo-tokenizer",
-                    }
-                ),
-            ),
-        )
-    )
-    logged = []
-
-    class FakeEvaluator:
-        def evaluate_model(self, model, device, checkpoint_step):
-            assert str(device) == "cpu"
-            assert checkpoint_step == 2
-            return {
-                "loss": 1.5,
-                "perplexity": 4.48,
-                "token_count": 128.0,
-                "sample_count": 8.0,
-            }
-
-    monkeypatch.setattr(trainer, "_get_pretrain_evaluator", lambda: FakeEvaluator())
-    monkeypatch.setattr(trainer, "_log_swanlab", lambda data: logged.append(data))
-
-    skipped = trainer._run_eval_if_needed(DummyModel(), torch.device("cpu"), 1)
-    elapsed = trainer._run_eval_if_needed(DummyModel(), torch.device("cpu"), 2)
-
-    assert skipped == 0.0
-    assert elapsed >= 0.0
-    assert logged == [
-        {
-            "eval/step": 2,
-            "eval/loss": 1.5,
-            "eval/perplexity": 4.48,
-            "eval/token_count": 128.0,
-            "eval/sample_count": 8.0,
-        }
-    ]
