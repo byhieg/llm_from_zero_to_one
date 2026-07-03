@@ -6,6 +6,7 @@ import pytest
 
 from logger import (
     NewLogger,
+    _get_rank,
     _get_ranked_log_file_path,
     get_logger,
     init_logger,
@@ -44,14 +45,14 @@ class TestGetLogger:
 
 class TestInitLogger:
     def test_basic_output(self, capsys):
-        init_logger(level="DEBUG", color=False)
+        init_logger(level="DEBUG")
         lg = get_logger("train")
         lg.info("hello")
         captured = capsys.readouterr()
         assert "hello" in captured.err
 
     def test_level_filtering(self, capsys):
-        init_logger(level="WARNING", color=False)
+        init_logger(level="WARNING")
         lg = get_logger("train")
         lg.debug("should not appear")
         lg.info("should not appear")
@@ -61,15 +62,15 @@ class TestInitLogger:
         assert "should appear" in captured.err
 
     def test_init_twice_is_noop(self, capsys):
-        init_logger(level="INFO", color=False)
-        init_logger(level="DEBUG", color=False)
+        init_logger(level="INFO")
+        init_logger(level="DEBUG")
         lg = get_logger("train")
         lg.debug("should not appear because second init is ignored")
         captured = capsys.readouterr()
         assert "should not appear" not in captured.err
 
     def test_numeric_level(self, capsys):
-        init_logger(level=logging.ERROR, color=False)
+        init_logger(level=logging.ERROR)
         lg = get_logger("train")
         lg.warning("hidden")
         lg.error("visible")
@@ -79,94 +80,88 @@ class TestInitLogger:
 
     def test_log_file(self, tmp_path):
         log_file = tmp_path / "test.log"
-        init_logger(level="DEBUG", log_file=str(log_file), color=False)
+        init_logger(level="DEBUG", log_file=str(log_file))
         lg = get_logger("train")
         lg.info("file output")
-        ranked_log_file = log_file.with_name(f"{log_file.name}.rank0")
+        ranked_log_file = tmp_path / "test_rank0.log"
         assert ranked_log_file.exists()
         assert "file output" in ranked_log_file.read_text()
-
-    def test_log_file_level(self, tmp_path):
-        log_file = tmp_path / "test.log"
-        init_logger(
-            level="DEBUG",
-            log_file=str(log_file),
-            log_file_level="WARNING",
-            color=False,
-        )
-        lg = get_logger("train")
-        lg.info("console only")
-        lg.warning("both")
-        ranked_log_file = log_file.with_name(f"{log_file.name}.rank0")
-        content = ranked_log_file.read_text()
-        assert "console only" not in content
-        assert "both" in content
 
     def test_log_file_writes_to_ranked_file(self, tmp_path):
         log_file = tmp_path / "test.log"
         with patch.dict(os.environ, {"RANK": "3"}):
-            init_logger(level="DEBUG", log_file=str(log_file), color=False)
+            init_logger(level="DEBUG", log_file=str(log_file))
             lg = get_logger("train")
             lg.info("ranked output")
-        ranked_log_file = tmp_path / "test.log.rank3"
+        ranked_log_file = tmp_path / "test_rank3.log"
         assert ranked_log_file.exists()
         assert "rank=3" in ranked_log_file.read_text()
         assert _get_ranked_log_file_path(str(log_file), 3) == str(ranked_log_file)
 
-    def test_custom_fmt(self, capsys):
-        init_logger(level="INFO", fmt="%(message)s", datefmt="%H", color=False)
-        lg = get_logger("train")
-        lg.info("raw message")
+    def test_level_can_be_read_from_env(self, capsys):
+        with patch.dict(os.environ, {"LLM_VERBOSITY": "ERROR"}):
+            init_logger()
+            lg = get_logger("train")
+            lg.warning("hidden by env")
+            lg.error("visible by env")
         captured = capsys.readouterr()
-        assert captured.err.strip() == "raw message"
+        assert "hidden by env" not in captured.err
+        assert "visible by env" in captured.err
 
-    def test_color_formatter_injects_ansi(self, capsys):
-        init_logger(level="INFO", color=True)
-        lg = get_logger("train")
-        lg.info("colored")
+    def test_project_logger_does_not_propagate_to_root(self):
+        records = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        root_handler = CaptureHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(root_handler)
+        try:
+            init_logger(level="INFO")
+            get_logger("train").info("project only")
+        finally:
+            root_logger.removeHandler(root_handler)
+
+        assert records == []
+
+    def test_external_logger_is_not_captured_by_project_logger(self, capsys):
+        init_logger(level="INFO")
+
+        external_logger = logging.getLogger("external_library")
+        external_logger.propagate = False
+        null_handler = logging.NullHandler()
+        external_logger.addHandler(null_handler)
+        try:
+            external_logger.warning("external message")
+        finally:
+            external_logger.removeHandler(null_handler)
+
         captured = capsys.readouterr()
-        assert "\033[" in captured.err
+        assert "external message" not in captured.err
 
+    def test_get_rank_only_reads_rank_env(self):
+        with patch.dict(os.environ, {"RANK": "3", "LOCAL_RANK": "0"}):
+            assert _get_rank() == 3
 
-class TestLogRank:
-    def test_matching_rank_logs(self, capsys):
-        with patch.dict(os.environ, {"RANK": "3"}):
-            reset_logger()
-            init_logger(level="DEBUG", rank=3, color=False)
-            lg = get_logger("train")
-            lg.info("from rank 3")
-            captured = capsys.readouterr()
-            assert "from rank 3" in captured.err
+        with patch.dict(os.environ, {"LOCAL_RANK": "2"}, clear=True):
+            assert _get_rank() == 0
 
-    def test_non_matching_rank_suppressed(self, capsys):
-        with patch.dict(os.environ, {"RANK": "3"}):
-            reset_logger()
-            init_logger(level="DEBUG", rank=0, color=False)
-            lg = get_logger("train")
-            lg.info("hidden")
-            captured = capsys.readouterr()
-            assert "hidden" not in captured.err
-
-    def test_env_rank_used_by_default(self, capsys):
-        with patch.dict(os.environ, {"RANK": "3"}):
-            reset_logger()
-            init_logger(level="DEBUG", color=False)
-            lg = get_logger("train")
-            lg.info("visible on env rank")
-            captured = capsys.readouterr()
-            assert "visible on env rank" in captured.err
+        with patch.dict(os.environ, {"RANK": "invalid"}):
+            assert _get_rank() == 0
 
 
 class TestResetLogger:
     def test_reset_allows_reinit(self, capsys):
-        init_logger(level="WARNING", color=False)
+        init_logger(level="WARNING")
         lg = get_logger("train")
         lg.debug("hidden")
         captured = capsys.readouterr()
         assert "hidden" not in captured.err
 
         reset_logger()
-        init_logger(level="DEBUG", color=False)
+        init_logger(level="DEBUG")
         lg = get_logger("train")
         lg.debug("visible now")
         captured = capsys.readouterr()

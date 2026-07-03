@@ -103,6 +103,20 @@ def make_pretrain_args(**overrides) -> PreTrainArgs:
     return args
 
 
+def test_is_deepspeed_backend_reflects_train_backend():
+    """测试 DeepSpeed 后端判断入口。"""
+
+    deepspeed_trainer = PreTrainTrainer(
+        make_pretrain_args(train=PreTrainTrainConfig(backend="deepspeed"))
+    )
+    naive_trainer = PreTrainTrainer(
+        make_pretrain_args(train=PreTrainTrainConfig(backend="naive"))
+    )
+
+    assert deepspeed_trainer._is_deepspeed_backend() is True
+    assert naive_trainer._is_deepspeed_backend() is False
+
+
 def test_get_train_dataset_config_inherits_seq_len():
     args = make_pretrain_args(
         train=PreTrainTrainConfig(seq_len=2048),
@@ -439,10 +453,10 @@ def test_run_delegates_deepspeed_step_and_boundary_to_engine(monkeypatch, tmp_pa
     monkeypatch.setattr(trainer, "_finish_swanlab", lambda: None)
     monkeypatch.setattr(
         trainer,
-          "_save_checkpoint",
-          lambda checkpoint_dir, global_step, epoch, micro_step_in_epoch, tag=None: (
-              saved_steps.append(global_step) if micro_step_in_epoch != 0 else None
-          ),
+        "_save_checkpoint",
+        lambda checkpoint_dir, global_step, epoch, micro_step_in_epoch, tag=None: (
+            saved_steps.append(global_step) if micro_step_in_epoch != 0 else None
+        ),
     )
 
     trainer.run()
@@ -569,6 +583,8 @@ def test_get_amp_dtype_and_grad_scaler(monkeypatch):
         is not None
     )
     assert calls == ["cuda"]
+
+
 def test_run_builds_optimizer_without_checkpoint_resume(monkeypatch):
     calls = []
 

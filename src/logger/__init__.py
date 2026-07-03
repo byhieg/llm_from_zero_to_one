@@ -1,9 +1,9 @@
 """项目统一日志封装。
 
-仅在标准库 ``logging`` 之上增加两点能力：
+仅管理本项目 ``llm.*`` 命名空间下的日志：
 
-1. 统一 ``llm.*`` 命名空间，避免各模块各自散落配置。
-2. 控制台支持按分布式 rank 过滤，仅输出指定 rank 的日志。
+1. 项目日志统一从 ``llm`` 根日志器输出。
+2. ``llm`` 日志不向 Python root logger 传播，避免影响第三方库。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import cast
 
 _LEVEL_COLORS: dict[int, str] = {
@@ -42,19 +43,6 @@ class _PlainFormatter(logging.Formatter):
         super().__init__(fmt=fmt, datefmt=datefmt)
 
 
-class _RankFilter(logging.Filter):
-    """仅允许目标 rank 的日志通过。"""
-
-    def __init__(self, rank: int = 0) -> None:
-        super().__init__()
-        self.target_rank: int = rank
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        current_rank = _get_rank()
-        record.rank = current_rank  # type: ignore[attr-defined]
-        return current_rank == self.target_rank
-
-
 class _InjectRankFilter(logging.Filter):
     """为日志记录补充当前 rank 信息。"""
 
@@ -64,20 +52,12 @@ class _InjectRankFilter(logging.Filter):
 
 
 def _get_rank() -> int:
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank()
-    except (ImportError, RuntimeError):
-        pass
-    for env_var in ("RANK", "LOCAL_RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK"):
-        val = os.environ.get(env_var)
-        if val is not None:
-            try:
-                return int(val)
-            except ValueError:
-                continue
+    val = os.environ.get("RANK")
+    if val is not None:
+        try:
+            return int(val)
+        except ValueError:
+            return 0
     return 0
 
 
@@ -92,13 +72,29 @@ def _detect_color_support() -> bool:
 
 
 def _get_ranked_log_file_path(log_file: str, rank: int) -> str:
-    return f"{log_file}.rank{rank}"
+    path = Path(log_file)
+    suffix = path.suffix or ".log"
+    return str(path.with_name(f"{path.stem}_rank{rank}{suffix}"))
 
 
 _ROOT_NAME = "llm"
+_VERBOSITY_ENV = "LLM_VERBOSITY"
 
 _global_handler_configured: bool = False
 NewLogger = logging.Logger
+
+
+def _resolve_log_level(level: str | int | None = None) -> int:
+    """解析日志等级，默认读取 ``LLM_VERBOSITY``。"""
+
+    if level is None:
+        level = os.environ.get(_VERBOSITY_ENV, "INFO")
+    if isinstance(level, int):
+        return level
+    level_name = level.upper()
+    if level_name not in logging._nameToLevel:
+        raise ValueError(f"Unknown logging level: {level}")
+    return logging._nameToLevel[level_name]
 
 
 def get_logger(name: str = "llm") -> logging.Logger:
@@ -109,36 +105,20 @@ def get_logger(name: str = "llm") -> logging.Logger:
 
 
 def init_logger(
-    level: str | int = "INFO",
+    level: str | int | None = None,
     *,
     log_file: str | None = None,
-    log_file_level: str | int | None = None,
-    rank: int | None = None,
-    fmt: str | None = None,
-    datefmt: str = "%Y-%m-%d %H:%M:%S",
-    color: bool | None = None,
 ) -> None:
     """初始化项目根日志器。"""
     global _global_handler_configured
     if _global_handler_configured:
         return
 
-    if rank is None:
-        rank = _get_rank()
     current_rank = _get_rank()
 
-    numeric_level = level if isinstance(level, int) else getattr(logging, level.upper())
-    file_level = (
-        numeric_level
-        if log_file_level is None
-        else (
-            log_file_level
-            if isinstance(log_file_level, int)
-            else getattr(logging, log_file_level.upper())
-        )
-    )
+    numeric_level = _resolve_log_level(level)
 
-    use_color = color if color is not None else _detect_color_support()
+    use_color = _detect_color_support()
 
     root_logger = get_logger("llm")
     root_logger.setLevel(logging.DEBUG)
@@ -146,25 +126,23 @@ def init_logger(
 
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(numeric_level)
-    console.addFilter(_RankFilter(rank))
     if use_color:
-        console.setFormatter(_ColorFormatter(fmt=fmt, datefmt=datefmt))
+        console.setFormatter(_ColorFormatter())
     else:
-        console.setFormatter(_PlainFormatter(fmt=fmt, datefmt=datefmt))
+        console.setFormatter(_PlainFormatter())
     root_logger.addHandler(console)
 
     if log_file is not None:
         file_fmt = (
-            fmt
-            or "%(asctime)s | %(levelname)-8s | rank=%(rank)s | %(name)s | %(message)s"
+            "%(asctime)s | %(levelname)-8s | rank=%(rank)s | %(name)s | %(message)s"
         )
         file_handler = logging.FileHandler(
             _get_ranked_log_file_path(log_file, current_rank),
             encoding="utf-8",
         )
-        file_handler.setLevel(file_level)
+        file_handler.setLevel(numeric_level)
         file_handler.addFilter(_InjectRankFilter())
-        file_handler.setFormatter(_PlainFormatter(fmt=file_fmt, datefmt=datefmt))
+        file_handler.setFormatter(_PlainFormatter(fmt=file_fmt))
         root_logger.addHandler(file_handler)
 
     _global_handler_configured = True

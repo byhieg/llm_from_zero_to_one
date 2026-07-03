@@ -7,14 +7,16 @@ import deepspeed
 import torch
 
 from .pretrain_args import PreTrainArgs
-
 from logger import get_logger
+
 logger = get_logger(__name__)
+
 
 class DeepSpeedPretrainRuntime:
     def __init__(self, args: PreTrainArgs):
         self.args = args
         self.deepspeed = self._import_deepspeed()
+        self._set_deepspeed_log_level("info")
         self.config = self._resolve_config()
         self.engine: deepspeed.DeepSpeedEngine | None = None
         self.optimizer = None
@@ -30,10 +32,19 @@ class DeepSpeedPretrainRuntime:
                 "train.backend=deepspeed but deepspeed is not installed, please install it first."
             ) from exc
 
+    def _set_deepspeed_log_level(self, level: str) -> None:
+        try:
+            from deepspeed.utils.logging import set_log_level_from_string
+        except ImportError:
+            return
+        set_log_level_from_string(level)
+
     def _resolve_config(self) -> str | dict[str, any]:
         config = self.args.train.deepspeed_config
         if not config:
             raise ValueError("train.deepspeed_config must be configured")
+        if isinstance(config, dict):
+            return config
         config_path = Path(config)
         if not config_path.exists():
             raise FileNotFoundError(f"DeepSpeed config file not found: {config_path}")
@@ -119,13 +130,16 @@ class DeepSpeedPretrainRuntime:
             return None
         return float(param_groups[0].get("lr", 0.0))
 
+    def __get_batch_size_per_gpu(self) -> int:
+        return self.engine.train_micro_batch_size_per_gpu()
+
     def save_checkpoint(
         self, checkpoint_dir: str, client_state: any, tag: str | None = None
     ) -> None:
         self.engine.save_checkpoint(
             save_dir=checkpoint_dir, client_state=client_state, tag=tag
-        )      
-
+        )
+        logger.info(f"save checkpoint {checkpoint_dir} success")
 
     def load_checkpoint(
         self, resume_checkpoint_dir: str, resume_tag: str

@@ -85,7 +85,7 @@ class PreTrainTrainer:
 
         ################################### 获取全局信息，进行打印 ###############################################
         world_size = self.rank_info["world_size"]
-        per_gpu_batch_size = self.args.train.batch_size
+        per_gpu_batch_size = self._get_batch_size_per_gpu()
         total_batch_size = per_gpu_batch_size * world_size
 
         self.device = self._get_device()
@@ -95,31 +95,31 @@ class PreTrainTrainer:
             if hasattr(model, "count_parameters")
             else sum(p.numel() for p in model.parameters() if p.requires_grad)
         )
-
-        logger.info(
-            f"model: {model.__class__.__name__}, trainable_params={trainable_params:,}"
-        )
-        logger.info(f"dataset size: {len(dataset)} samples")
-        logger.info(
-            f"world_size={world_size}, "
-            f"rank={self.rank_info['rank']}, "
-            f"local_rank={self.rank_info['local_rank']}"
-        )
-        logger.info(f"train device: {self.device}")
-        logger.info(
-            f"batch size: {per_gpu_batch_size} per GPU × {world_size} GPU = {total_batch_size} total"
-        )
-        logger.info(
-            f"dataloader batch num: {len(dataloader)} per GPU, "
-            f"total batch num: {len(dataloader) * world_size}"
-        )
+        if self._is_main_process():
+            logger.info(
+                f"model: {model.__class__.__name__}, trainable_params={trainable_params:,}"
+            )
+            logger.info(f"dataset size: {len(dataset)} samples")
+            logger.info(
+                f"world_size={world_size}, "
+                f"rank={self.rank_info['rank']}, "
+                f"local_rank={self.rank_info['local_rank']}"
+            )
+            logger.info(f"train device: {self.device}")
+            logger.info(
+                f"batch size: {per_gpu_batch_size} per GPU × {world_size} GPU = {total_batch_size} total"
+            )
+            logger.info(
+                f"dataloader batch num: {len(dataloader)} per GPU, "
+                f"total batch num: {len(dataloader) * world_size}"
+            )
 
         ################################### 初始化训练引擎，checkpoint 恢复 ###############################################
 
         backend_state = self._prepare_backend(model, self.device)
 
         if self.args.checkpoint.resume_checkpoint_dir:
-            if self.args.train.backend == "deepspeed":
+            if self._is_deepspeed_backend():
                 load_path, states = self._deepspeed_runtime.load_checkpoint(
                     self.args.checkpoint.resume_checkpoint_dir,
                     self.args.checkpoint.resume_tag,
@@ -141,8 +141,7 @@ class PreTrainTrainer:
                 Path(self.args.checkpoint.save_checkpoint_dir)
                 / self.args.experiment.name
             )
-            os.makedirs(
-                self.args.checkpoint.save_checkpoint_dir, exist_ok=True)
+            os.makedirs(self.args.checkpoint.save_checkpoint_dir, exist_ok=True)
         if self._is_main_process():
             self._init_swanlab(
                 self.device, dataset, dataloader, run_id=self._swanlab_run_id
@@ -151,10 +150,11 @@ class PreTrainTrainer:
         accumulation_steps = self._get_backend_accumulation_steps(backend_state)
         steps_per_epoch = len(dataloader) // accumulation_steps
         max_steps = self.args.train.epoch_num * steps_per_epoch
-        logger.info(
-            f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
-            f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps}, save checkpoint step:{self.args.checkpoint.save_step})"
-        )
+        if self._is_main_process():
+            logger.info(
+                f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
+                f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps}, save checkpoint step:{self.args.checkpoint.save_step})"
+            )
         tokens = (
             self.args.train.batch_size
             * self.args.train.seq_len
@@ -230,7 +230,7 @@ class PreTrainTrainer:
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             if world_size > 1:
                 if torch.cuda.is_available():
-                    if self.args.train.backend == "deepspeed":
+                    if self._is_deepspeed_backend():
                         self._init_deepspeed()
                     else:
                         dist.init_process_group(backend="nccl")
@@ -278,6 +278,11 @@ class PreTrainTrainer:
     def _is_main_process(self) -> bool:
         return self.rank_info["rank"] == 0
 
+    def _is_deepspeed_backend(self) -> bool:
+        """判断当前训练后端是否为 DeepSpeed。"""
+
+        return self.args.train.backend == "deepspeed"
+
     def _init_deepspeed(self) -> deepspeed_train.DeepSpeedPretrainRuntime:
         if getattr(self, "_deepspeed_runtime", None) is None:
             self._deepspeed_runtime: deepspeed_train.DeepSpeedPretrainRuntime = (
@@ -292,23 +297,28 @@ class PreTrainTrainer:
         model: torch.nn.Module,
         device: torch.device,
     ):
-        if self.args.train.backend == "deepspeed":
+        if self._is_deepspeed_backend():
             return self._deepspeed_runtime.prepare(model)
         return naive_train.prepare_backend(self, model, device, None)
 
     def _get_backend_accumulation_steps(self, backend_state) -> int:
-        if self.args.train.backend == "deepspeed":
+        if self._is_deepspeed_backend():
             return self._deepspeed_runtime.get_accumulation_steps()
         return naive_train.get_accumulation_steps(backend_state)
 
+    def _get_batch_size_per_gpu(self) -> int:
+        if self._is_deepspeed_backend():
+            return self._deepspeed_runtime.__get_batch_size_per_gpu()
+        return self.args.train.batch_size
+
     def _set_backend_train_mode(self, backend_state) -> None:
-        if self.args.train.backend == "deepspeed":
+        if self._is_deepspeed_backend():
             self._deepspeed_runtime.set_train_mode()
             return
         naive_train.set_train_mode(backend_state)
 
     def _train_backend_batch(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> dict:
-        if self.args.train.backend == "deepspeed":
+        if self._is_deepspeed_backend():
             return self._deepspeed_runtime.train(x=x, y=y, device=self.device)
         return naive_train.train_batch(self, x=x, y=y, device=self.device, **kwargs)
 
@@ -454,7 +464,7 @@ class PreTrainTrainer:
         micro_step_in_epoch: int,
         tag: str | None = None,
     ) -> None:
-        if self.args.train.backend == "deepspeed":
+        if self._is_deepspeed_backend():
             state = {
                 "global_step": global_step,
                 "start_epoch": epoch,

@@ -109,6 +109,23 @@ class PreTrainArgs(TrainingArgs):
         experiment_dict = data.get("experiment", {})
         swanlab_dict = experiment_dict.get("swanlab", {})
         data_dict = data.get("data", {})
+        checkpoint_dict = dict(data.get("checkpoint", {}))
+        if "save_steps" in checkpoint_dict and "save_step" not in checkpoint_dict:
+            checkpoint_dict["save_step"] = checkpoint_dict.pop("save_steps")
+        if (
+            "checkpoint_dir" in checkpoint_dict
+            and "save_checkpoint_dir" not in checkpoint_dict
+        ):
+            checkpoint_dict["save_checkpoint_dir"] = checkpoint_dict.pop(
+                "checkpoint_dir"
+            )
+        if (
+            "resume_from_checkpoint" in checkpoint_dict
+            and "resume_checkpoint_dir" not in checkpoint_dict
+        ):
+            checkpoint_dict["resume_checkpoint_dir"] = checkpoint_dict.pop(
+                "resume_from_checkpoint"
+            )
 
         return cls(
             experiment=ExperimentConfig(
@@ -123,7 +140,7 @@ class PreTrainArgs(TrainingArgs):
             model=ModelConfig(**data.get("model", {})),
             train=PreTrainTrainConfig(**data.get("train", {})),
             eval=PreTrainEvalConfig(**data.get("eval", {})),
-            checkpoint=PreTrainCheckpointConfig(**data.get("checkpoint", {})),
+            checkpoint=PreTrainCheckpointConfig(**checkpoint_dict),
             data=PreTrainDataConfig(
                 train=PreTrainTrainDataConfig(**data_dict.get("train", {})),
                 eval=PreTrainEvalDataConfig(**data_dict.get("eval", {})),
