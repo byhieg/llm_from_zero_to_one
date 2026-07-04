@@ -15,8 +15,8 @@ from trainer.common_args import (
 class PreTrainTrainConfig:
     """预训练 train 模块配置。"""
 
-    epoch_num: int = 1
     batch_size: int = 16
+    total_tokens: int = -1
     seq_len: int = 1024
     seed: int = 42
     log_steps: int = 10
@@ -132,23 +132,15 @@ class PreTrainArgs(TrainingArgs):
         train_dataset_config = self.data.train.dataset_config
         dataloader_config = self.data.train.dataloader_config
 
-        if self.train.epoch_num > 0 and not train_dataset_config.get("dataset_path"):
+        if self.train.total_tokens <= 0 or not train_dataset_config.get("dataset_path"):
             errors.append(
-                "data.train.dataset_config.dataset_path is required when train.epoch_num > 0"
+                "data.train.dataset_config.dataset_path is required and train.total_tokens must be positive"
             )
 
         if self.data.train.data_strategy not in ("padding", "megatron"):
             errors.append(
                 "data.train.data_strategy must be 'padding' or 'megatron', "
                 f"got '{self.data.train.data_strategy}'"
-            )
-
-        if (
-            self.data.train.data_strategy == "megatron"
-            and "total_token" not in train_dataset_config
-        ):
-            errors.append(
-                "data.train.dataset_config.total_token is required when using 'megatron' strategy"
             )
 
         dataloader_num_workers = dataloader_config.get("num_workers", 0)

@@ -120,6 +120,14 @@ class PreTrainTrainer:
 
         ################################### 初始化训练引擎，checkpoint 恢复 ###############################################
 
+        accumulation_steps = self._get_backend_accumulation_steps(backend_state)
+        steps_per_epoch = len(dataloader) // accumulation_steps
+        tokens_per_step = self._get_tokens_per_step(
+            per_gpu_batch_size=per_gpu_batch_size,
+            accumulation_steps=accumulation_steps,
+        )
+        max_steps = self._get_max_steps(tokens_per_step)
+
         if self.args.checkpoint.resume_checkpoint_dir:
             if self._is_deepspeed_backend():
                 load_path, states = self._deepspeed_runtime.load_checkpoint(
@@ -130,6 +138,15 @@ class PreTrainTrainer:
                 start_epoch = states["start_epoch"]
                 start_micro_step_in_epoch = states["start_micro_step_in_epoch"]
                 self._swanlab_run_id = states["swanlab_run_id"]
+                processed_tokens_seen = int(
+                    states.get(
+                        "processed_tokens_seen",
+                        states.get(
+                            "total_effective_tokens_seen",
+                            global_step * tokens_per_step,
+                        ),
+                    )
+                )
                 logger.info(
                     f"Checkpoint prepare to resume checkpoint path:{load_path},states:{states}"
                 )
@@ -140,6 +157,8 @@ class PreTrainTrainer:
             global_step = 0
             start_epoch = 0
             start_micro_step_in_epoch = 0
+            processed_tokens_seen = 0
+
         if self.args.checkpoint.save_checkpoint_dir:
             self.args.checkpoint.save_checkpoint_dir = str(
                 Path(self.args.checkpoint.save_checkpoint_dir)
@@ -151,31 +170,25 @@ class PreTrainTrainer:
                 self.device, dataset, dataloader, run_id=self._swanlab_run_id
             )
 
-        accumulation_steps = self._get_backend_accumulation_steps(backend_state)
-        steps_per_epoch = len(dataloader) // accumulation_steps
-        max_steps = self.args.train.epoch_num * steps_per_epoch
         if self._is_main_process():
+            actual_total_tokens = max_steps * tokens_per_step
             logger.info(
-                f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
-                f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, save checkpoint step:{self.args.checkpoint.save_step})"
+                f"train.total_tokens={self.args.train.total_tokens}, "
+                f"tokens_per_step={tokens_per_step}, max_steps={max_steps}, "
+                f"actual_total_tokens={actual_total_tokens}, "
+                f"perepoch steps={steps_per_epoch}, accumulation_steps={accumulation_steps}, "
+                f"save checkpoint step={self.args.checkpoint.save_step}"
             )
-        tokens = (
-            self.args.train.batch_size
-            * self.args.train.seq_len
-            * accumulation_steps
-            * self.args.train.log_steps
-            * self.rank_info["world_size"]
-        )
+        train_tokens_in_log_step = tokens_per_step * self.args.train.log_steps
         try:
-            for epoch in range(start_epoch, self.args.train.epoch_num):
+            epoch = start_epoch
+            micro_step_offset = start_micro_step_in_epoch
+            while global_step < max_steps:
                 self._set_dataloader_epoch(dataloader, epoch)
                 self._set_backend_train_mode(backend_state)
                 logger.info(f"🚀 Epoch {epoch} start to train")
                 self._log_swanlab({"train/epoch": epoch})
                 start_time = time.perf_counter()
-                micro_step_offset = (
-                    start_micro_step_in_epoch if epoch == start_epoch else 0
-                )
                 epoch_iterator = self._build_epoch_iterator(
                     dataloader, micro_step_offset
                 )
@@ -188,15 +201,20 @@ class PreTrainTrainer:
                         y.to(self.device, non_blocking=True),
                     )
                     step_result = self._train_backend_batch(
-                        backend_state=backend_state,
-                        x=x,
-                        y=y,
-                        global_step=global_step,
-                        max_steps=max_steps,
-                        micro_step=step + 1,
+                        backend_state=backend_state, x=x, y=y
                     )
                     if not step_result:
                         continue
+
+                    global_step += 1
+                    processed_tokens_seen += tokens_per_step
+                    next_epoch, next_micro_step_in_epoch = (
+                        self._resolve_next_resume_position(
+                            epoch=epoch,
+                            micro_step_in_epoch=step + 1,
+                            dataloader_length=len(dataloader),
+                        )
+                    )
                     grad_norm = (
                         step_result.grad_norm
                         if step_result.grad_norm is not None
@@ -204,14 +222,16 @@ class PreTrainTrainer:
                     )
 
                     if (
-                        self.args.checkpoint.save_step > 0
+                        self.args.checkpoint.save_checkpoint_dir
+                        and self.args.checkpoint.save_step > 0
                         and global_step % self.args.checkpoint.save_step == 0
                     ):
                         self._save_checkpoint(
                             checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
-                            global_step=global_step + 1,
-                            epoch=epoch,
-                            micro_step_in_epoch=step + 1,
+                            global_step=global_step,
+                            start_epoch=next_epoch,
+                            start_micro_step_in_epoch=next_micro_step_in_epoch,
+                            processed_tokens_seen=processed_tokens_seen,
                         )
                     if global_step % self.args.train.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -221,23 +241,73 @@ class PreTrainTrainer:
                                 "train/loss": step_result.log_loss.item(),
                                 "train/grad_norm": grad_norm.item(),
                                 "train/lr": step_result.lr or 0.0,
-                                "train/throughput": int(tokens / (elapsed_ms / 1000)),
+                                "train/processed_tokens": processed_tokens_seen,
+                                "train/throughput": int(
+                                    train_tokens_in_log_step / (elapsed_ms / 1000)
+                                ),
                             }
                         )
                         start_time = time.perf_counter()
 
-                    global_step += 1
+                    if global_step >= max_steps:
+                        epoch = next_epoch
+                        micro_step_offset = next_micro_step_in_epoch
+                        break
+                else:
+                    epoch += 1
+                    micro_step_offset = 0
+                    continue
+                break
 
-            if self.args.train.epoch_num > start_epoch:
-                self._save_checkpoint(
-                    checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
-                    global_step=global_step,
-                    epoch=epoch,
-                    micro_step_in_epoch=0,
-                )
+            self._save_checkpoint(
+                checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
+                global_step=global_step,
+                start_epoch=epoch,
+                start_micro_step_in_epoch=micro_step_offset,
+                processed_tokens_seen=processed_tokens_seen,
+                tag="final",
+            )
 
         finally:
             self._finish_swanlab()
+
+    def _get_tokens_per_step(
+        self, per_gpu_batch_size: int, accumulation_steps: int
+    ) -> int:
+        tokens_per_step = (
+            per_gpu_batch_size
+            * self.args.train.seq_len
+            * accumulation_steps
+            * self.rank_info["world_size"]
+        )
+        if tokens_per_step <= 0:
+            raise ValueError("tokens per step must be greater than 0")
+        return tokens_per_step
+
+    def _get_max_steps(self, tokens_per_step: int) -> int:
+        total_tokens = int(self.args.train.total_tokens)
+        if total_tokens <= 0:
+            raise ValueError("train.total_tokens must be greater than 0")
+        max_steps = total_tokens // tokens_per_step
+        if max_steps <= 0:
+            raise ValueError(
+                "train.total_tokens is smaller than one optimizer step token budget: "
+                f"total_tokens={total_tokens}, tokens_per_step={tokens_per_step}"
+            )
+        remainder_tokens = total_tokens % tokens_per_step
+        if remainder_tokens > 0 and self._is_main_process():
+            logger.warning(
+                "train.total_tokens is not divisible by tokens_per_step, "
+                f"remainder tokens will be ignored: remainder={remainder_tokens}"
+            )
+        return max_steps
+
+    def _resolve_next_resume_position(
+        self, epoch: int, micro_step_in_epoch: int, dataloader_length: int
+    ) -> tuple[int, int]:
+        if micro_step_in_epoch >= dataloader_length:
+            return epoch + 1, 0
+        return epoch, micro_step_in_epoch
 
     def _build_distributed(self) -> None:
         if not dist.is_initialized():
@@ -333,25 +403,12 @@ class PreTrainTrainer:
         naive_train.set_train_mode(backend_state)
 
     def _train_backend_batch(
-        self,
-        backend_state,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        global_step: int,
-        max_steps: int,
-        micro_step: int,
+        self, backend_state, x: torch.Tensor, y: torch.Tensor, **kwargs
     ) -> TrainStepOutput | None:
         if self._is_deepspeed_backend():
             return self._deepspeed_runtime.train(x=x, y=y, device=self.device)
         return naive_train.train_batch(
-            self,
-            backend_state=backend_state,
-            x=x,
-            y=y,
-            global_step=global_step,
-            max_steps=max_steps,
-            micro_step=micro_step,
-            device=self.device,
+            self, backend_state=backend_state, x=x, y=y, device=self.device, **kwargs
         )
 
     def _get_model_config(self) -> dict:
@@ -492,20 +549,26 @@ class PreTrainTrainer:
         self,
         checkpoint_dir,
         global_step: int,
-        epoch: int,
-        micro_step_in_epoch: int,
+        start_epoch: int,
+        start_micro_step_in_epoch: int,
+        processed_tokens_seen: int,
         tag: str | None = None,
     ) -> None:
+        if not checkpoint_dir:
+            return
         if self._is_deepspeed_backend():
             state = {
                 "global_step": global_step,
-                "start_epoch": epoch,
-                "start_micro_step_in_epoch": micro_step_in_epoch,
+                "start_epoch": start_epoch,
+                "start_micro_step_in_epoch": start_micro_step_in_epoch,
                 "swanlab_run_id": self._swanlab_run_id,
+                "processed_tokens_seen": processed_tokens_seen,
             }
             self._deepspeed_runtime.save_checkpoint(checkpoint_dir, state, tag)
             logger.info(
-                f"save checkpoint global_step: {global_step} epoch: {epoch} micro_step_in_epoch:{micro_step_in_epoch} checkpoint_dir:{checkpoint_dir}"
+                f"save checkpoint global_step: {global_step} start_epoch: {start_epoch} "
+                f"start_micro_step_in_epoch:{start_micro_step_in_epoch} "
+                f"processed_tokens_seen:{processed_tokens_seen} checkpoint_dir:{checkpoint_dir}"
             )
 
         # naive_train.save_checkpoint_if_needed(
