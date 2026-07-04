@@ -48,21 +48,6 @@ data:
     persistent_workers: false
     seed: 42
 
-eval:
-  steps: 1000
-  dataset_path: json
-  dataset_name: ""
-  data_files:
-    train: train_data/pretrain_t2t_eval_unseen_1024.jsonl
-  split: train
-  text_column: text
-  tokenizer_path: jingyaogong/minimind-3
-  max_samples: 1024
-  batch_size: 8
-  add_bos_id: false
-  add_eos_id: true
-  checkpoint_step: null
-
 optimizer:
   name: adamw
   weight_decay: 0.0

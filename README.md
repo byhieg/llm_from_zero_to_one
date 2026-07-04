@@ -17,7 +17,7 @@
 
 ## 📖 简介
 
-`llm-from-zero-to-one` 是一个**从零手写实现的大语言模型（LLM）训练框架**，旨在帮助开发者深入理解 LLM 训练的每一个核心环节。项目采用纯 PyTorch 实现，不依赖 HuggingFace Transformers 的模型代码，完整覆盖了从数据预处理、模型定义、训练循环到评估推理的全流程。
+`llm-from-zero-to-one` 是一个**从零手写实现的大语言模型（LLM）训练框架**，旨在帮助开发者深入理解 LLM 训练的每一个核心环节。项目采用纯 PyTorch 实现，不依赖 HuggingFace Transformers 的模型代码，覆盖从数据预处理、模型定义到训练循环的核心流程。
 
 本项目适合：
 - **学习者**：想理解 Transformer/GPT 模型底层原理和训练细节的开发者
@@ -51,7 +51,6 @@
 | **编译加速** | torch.compile | 自动启用 PyTorch 2.x 编译加速（CUDA/MPS） |
 | **数据加载** | 双策略支持 | Padding（边训边分词）/ Megatron（预先分词 .bin/.idx）两种模式 |
 | **检查点管理** | 断点续训 | 支持按步保存、自动恢复最新检查点、配置兼容性校验 |
-| **评估系统** | 困惑度评估 | 训练中可周期性评估 Loss / Perplexity / Token 吞吐量 |
 | **实验跟踪** | SwanLab 集成 | 可选接入 SwanLab 进行实验可视化与参数记录 |
 | **数据处理工具** | 数据预处理 | 提供文本分词 → `.bin` + `.idx` 文件生成的完整流水线 |
 
@@ -79,8 +78,6 @@
 | **数据加载 - Padding 策略** | ✅ 已支持 | 边训练边分词，HuggingFace Datasets 集成 |
 | **数据加载 - Megatron 策略** | ✅ 已支持 | 预先分词 (.bin + .idx 内存映射) |
 | **检查点保存/恢复** | ✅ 已支持 | 按步保存 + 断点续训 + 配置兼容校验 |
-| **训练中评估** | ✅ 已支持 | Loss / Perplexity / 吞吐量 |
-| **独立评估模式** | ✅ 已支持 | 对已有 checkpoint 执行评估 |
 | **SwanLab 实验跟踪** | ✅ 已支持 | 参数/指标可视化 |
 | **YAML 配置管理** | ✅ 已支持 | 环境变量替换 + 校验 + 默认生成 |
 | **数据处理工具链** | ✅ 已支持 | 分词 → .bin/.idx 生成 |
@@ -138,13 +135,6 @@ uv run python3 -m main --config configs/pretrain_padding_example.yaml
 uv run python3 -m main --config my_config.yaml --generate-config
 ```
 
-### 运行评估
-
-```bash
-# 对已有 checkpoint 执行评估
-uv run python3 -m main --config configs/eval_minimind_unseen_1024.yaml
-```
-
 ### 数据预处理（Megatron 格式）
 
 ```bash
@@ -158,8 +148,7 @@ uv run python3 tools/llm_data_processor.py
 llm_from_zero_to_one/
 ├── configs/                      # YAML 配置文件
 │   ├── pretrain_padding_example.yaml    # Padding 策略预训练示例
-│   ├── pretrain_megatron_example.yaml   # Megatron 策略预训练示例
-│   └── eval_*.yaml                       # 评估配置
+│   └── pretrain_megatron_example.yaml   # Megatron 策略预训练示例
 ├── src/
 │   ├── models/                   # 模型模块
 │   │   ├── gpt2/                        # GPT-2 模型实现
@@ -177,10 +166,6 @@ llm_from_zero_to_one/
 │   │   ├── dataset_factory.py           # 数据策略工厂
 │   │   ├── padding_dataset.py          # Padding 策略数据集
 │   │   └── simple_megatron_dataset/     # Megatron 策略数据集 (.bin/.idx)
-│   ├── checkpoint_manager/       # 检查点管理
-│   │   └── checkpoint_manager.py        # 保存/加载/恢复
-│   ├── evaluator/                # 评估模块
-│   │   └── checkpoint_evaluator.py      # Perplexity 评估器
 │   └── logger/                   # 日志模块
 ├── tools/                       # 辅助工具脚本
 │   ├── llm_data_processor.py            # 数据预处理（生成 .bin/.idx）
@@ -196,7 +181,7 @@ llm_from_zero_to_one/
 项目通过 **YAML 配置文件** 驱动所有训练参数，核心配置项：
 
 ```yaml
-mode: pretrain                    # 运行模式: pretrain | eval
+mode: pretrain                    # 运行模式
 
 name: experiment_name             # 实验名称（用于 checkpoint 目录）
 
@@ -231,11 +216,6 @@ data:
 checkpoint:
   save_steps: 1000                # 每 N 步保存一次
   checkpoint_dir: checkpoints/pretrain  # 检查点目录
-
-eval:
-  steps: 1000                     # 每 N 步执行一次评估（0=关闭）
-  dataset_path: ...               # 评估数据集路径
-  max_samples: 256                # 最大评估样本数
 
 optimizer:
   name: adamw                     # 优化器: adamw | adam

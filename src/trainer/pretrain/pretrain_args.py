@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from trainer.common_args import (
     ExperimentConfig,
@@ -27,16 +27,6 @@ class PreTrainTrainConfig:
 
 
 @dataclass
-class PreTrainEvalConfig:
-    """预训练 eval 模块配置。"""
-
-    steps: int = 0
-    max_samples: int = 256
-    batch_size: int = 8
-    checkpoint_step: Optional[int] = None
-
-
-@dataclass
 class PreTrainCheckpointConfig:
     """预训练 checkpoint 模块配置。"""
 
@@ -56,18 +46,10 @@ class PreTrainTrainDataConfig:
 
 
 @dataclass
-class PreTrainEvalDataConfig:
-    """预训练评估数据配置。"""
-
-    dataset_config: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class PreTrainDataConfig:
     """预训练 data 模块配置。"""
 
     train: PreTrainTrainDataConfig = field(default_factory=PreTrainTrainDataConfig)
-    eval: PreTrainEvalDataConfig = field(default_factory=PreTrainEvalDataConfig)
 
 
 @dataclass
@@ -77,7 +59,6 @@ class PreTrainArgs(TrainingArgs):
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: PreTrainTrainConfig = field(default_factory=PreTrainTrainConfig)
-    eval: PreTrainEvalConfig = field(default_factory=PreTrainEvalConfig)
     checkpoint: PreTrainCheckpointConfig = field(
         default_factory=PreTrainCheckpointConfig
     )
@@ -97,7 +78,6 @@ class PreTrainArgs(TrainingArgs):
             "experiment": experiment,
             "model": asdict(self.model),
             "train": asdict(self.train),
-            "eval": asdict(self.eval),
             "checkpoint": asdict(self.checkpoint),
             "data": asdict(self.data),
         }
@@ -139,11 +119,9 @@ class PreTrainArgs(TrainingArgs):
             ),
             model=ModelConfig(**data.get("model", {})),
             train=PreTrainTrainConfig(**data.get("train", {})),
-            eval=PreTrainEvalConfig(**data.get("eval", {})),
             checkpoint=PreTrainCheckpointConfig(**checkpoint_dict),
             data=PreTrainDataConfig(
                 train=PreTrainTrainDataConfig(**data_dict.get("train", {})),
-                eval=PreTrainEvalDataConfig(**data_dict.get("eval", {})),
             ),
         )
 
@@ -152,7 +130,6 @@ class PreTrainArgs(TrainingArgs):
 
         errors = []
         train_dataset_config = self.data.train.dataset_config
-        eval_dataset_config = self.data.eval.dataset_config
         dataloader_config = self.data.train.dataloader_config
 
         if self.train.epoch_num > 0 and not train_dataset_config.get("dataset_path"):
@@ -216,33 +193,6 @@ class PreTrainArgs(TrainingArgs):
             errors.append(
                 "train.megatron_config.global_batch_size is required when backend='megatron'"
             )
-
-        if self.eval.steps < 0:
-            errors.append(f"eval.steps must be non-negative, got {self.eval.steps}")
-        if self.eval.steps > 0:
-            if not eval_dataset_config.get("dataset_path"):
-                errors.append(
-                    "data.eval.dataset_config.dataset_path is required when eval.steps > 0"
-                )
-            if not (
-                eval_dataset_config.get("text_column")
-                or eval_dataset_config.get("col_name")
-            ):
-                errors.append(
-                    "data.eval.dataset_config.text_column is required when eval.steps > 0"
-                )
-            if self.eval.max_samples <= 0:
-                errors.append(
-                    f"eval.max_samples must be positive, got {self.eval.max_samples}"
-                )
-            if self.eval.batch_size <= 0:
-                errors.append(
-                    f"eval.batch_size must be positive, got {self.eval.batch_size}"
-                )
-            if not eval_dataset_config.get("tokenizer_path"):
-                errors.append(
-                    "data.eval.dataset_config.tokenizer_path is required when eval.steps > 0"
-                )
 
         if self.experiment.swanlab.enabled:
             if not self.experiment.swanlab.project:

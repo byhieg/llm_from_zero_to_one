@@ -23,12 +23,6 @@ train:
   backend: deepspeed
   deepspeed_config: /root/llm_from_zero_to_one/configs/deepspeed_zero0_autodl_pretrain_minimind.json
 
-eval:
-  steps: 1000
-  max_samples: 1024
-  batch_size: 16
-  checkpoint_step: null
-
 checkpoint:
   save_step: 50
   save_checkpoint_dir: /root/autodl-tmp/checkpoint
@@ -55,15 +49,3 @@ data:
       drop_last: false
       persistent_workers: false
       seed: 42
-
-  eval:
-    dataset_config:
-      dataset_path: json
-      dataset_name: ""
-      data_files:
-        train: ${AUTODL_PRETRAIN_EVAL_FILE:-/root/autodl-tmp/pretrain_t2t_eval_unseen_1024.jsonl}
-      split: train
-      text_column: text
-      tokenizer_path: jingyaogong/minimind-3
-      add_bos_id: true
-      add_eos_id: true

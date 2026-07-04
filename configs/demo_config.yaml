@@ -24,10 +24,6 @@ train:
   backend: deepspeed
   deepspeed_config: xxx/deepspeed_config.json
 
-eval:
-  max_samples: 1024
-  batch_size: 16
-
 checkpoint:
   save_steps: 1000
   checkpoint_dir: checkpoints/pretrain
@@ -53,18 +49,3 @@ data:
       drop_last: false
       persistent_workers: false
       seed: 42
-  
-  eval:
-    dataset_config:
-      dataset_path: json
-      dataset_name: ""
-      data_files:
-        train: /root/autodl-tmp/pretrain_t2t_eval_unseen_1024.jsonl
-      split: train
-      text_column: text
-      tokenizer_path: jingyaogong/minimind-3
-      add_bos_id: true
-      add_eos_id: true
-
-
-

@@ -63,7 +63,6 @@ where = ["src"]
 include = [
     "checkpoint_manager*",
     "dataset*",
-    "evaluator*",
     "logger*",
     "models*",
     "trainer*",

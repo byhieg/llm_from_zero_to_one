@@ -157,7 +157,7 @@ class PreTrainTrainer:
         if self._is_main_process():
             logger.info(
                 f"total steps num: {max_steps} (epoch_num: {self.args.train.epoch_num}, "
-                f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, eval_steps: {self.args.eval.steps}, save checkpoint step:{self.args.checkpoint.save_step})"
+                f"perepoch steps: {steps_per_epoch}, accumulation_steps: {accumulation_steps}, save checkpoint step:{self.args.checkpoint.save_step})"
             )
         tokens = (
             self.args.train.batch_size
