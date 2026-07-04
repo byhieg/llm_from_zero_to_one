@@ -25,12 +25,7 @@ Options:
 Environment variables with the same names are also supported:
   REMOTE_HOST, REMOTE_USER, REMOTE_PORT, REMOTE_DIR, SSH_KEY, DRY_RUN
 
-Only Git-visible files are synced:
-  - tracked files
-  - untracked files not ignored by .gitignore
-
-Ignored files such as .venv, __pycache__, checkpoints, train_data and swanlog are
-not copied.
+Files and directories listed in .gitignore are not copied.
 EOF
 }
 
@@ -85,15 +80,34 @@ if [[ -n "$SSH_KEY" ]]; then
   SSH_ARGS+=(-i "$SSH_KEY")
 fi
 
-RSYNC_ARGS=(-az --human-readable --info=stats2,progress2 --files-from=-)
+RSYNC_ARGS=(
+  -az
+  --human-readable
+  --info=stats2,progress2
+  --exclude=__pycache__/
+  --exclude='*.py[oc]'
+  --exclude=build/
+  --exclude=dist/
+  --exclude=wheels/
+  --exclude='*.egg-info'
+  --exclude=.venv/
+  --exclude=.sisyphus/
+  --exclude=.ruff_cache/
+  --exclude=train_data/
+  --exclude=checkpoints/
+  --exclude=.DS_Store
+  --exclude=.pytest_cache/
+  --exclude=.trae/
+  --exclude=swanlog/
+  --exclude=.vscode/
+)
 if [[ "$DRY_RUN" == "1" ]]; then
   RSYNC_ARGS+=(--dry-run --itemize-changes)
 fi
 
-echo "Syncing Git-visible files to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+echo "Syncing project to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
 
 ssh "${SSH_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '$REMOTE_DIR'"
 
-git ls-files --cached --others --exclude-standard -z \
-  | rsync "${RSYNC_ARGS[@]}" -e "ssh ${SSH_ARGS[*]}" --from0 ./ \
-      "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
+rsync "${RSYNC_ARGS[@]}" -e "ssh ${SSH_ARGS[*]}" ./ \
+  "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
