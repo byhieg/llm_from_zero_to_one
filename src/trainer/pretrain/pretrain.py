@@ -15,8 +15,10 @@ from logger import get_logger
 from models import create_model
 
 from . import deepspeed_train, naive_train
+from .backend_output import TrainStepOutput
 from .pretrain_args import PreTrainArgs
 from itertools import islice
+
 logger = get_logger(__name__)
 
 
@@ -53,7 +55,7 @@ class ResumableDistributedSampler(DistributedSampler):
 
     def __iter__(self):
         # 直接复用父类的分片逻辑
-        return islice(super().__iter__(),self.sample_offset,None)
+        return islice(super().__iter__(), self.sample_offset, None)
 
 
 class PreTrainTrainer:
@@ -83,13 +85,15 @@ class PreTrainTrainer:
         )
         dataloader = self._build_dataloader(dataset)
 
+        self.device = self._get_device()
+        model = create_model(self.args.model.name, self._get_model_config())
+        backend_state = self._prepare_backend(model, self.device)
+
         ################################### 获取全局信息，进行打印 ###############################################
         world_size = self.rank_info["world_size"]
         per_gpu_batch_size = self._get_batch_size_per_gpu()
         total_batch_size = per_gpu_batch_size * world_size
 
-        self.device = self._get_device()
-        model = create_model(self.args.model.name, self._get_model_config())
         trainable_params = (
             model.count_parameters()
             if hasattr(model, "count_parameters")
@@ -116,8 +120,6 @@ class PreTrainTrainer:
 
         ################################### 初始化训练引擎，checkpoint 恢复 ###############################################
 
-        backend_state = self._prepare_backend(model, self.device)
-
         if self.args.checkpoint.resume_checkpoint_dir:
             if self._is_deepspeed_backend():
                 load_path, states = self._deepspeed_runtime.load_checkpoint(
@@ -128,7 +130,9 @@ class PreTrainTrainer:
                 start_epoch = states["start_epoch"]
                 start_micro_step_in_epoch = states["start_micro_step_in_epoch"]
                 self._swanlab_run_id = states["swanlab_run_id"]
-                logger.info(f"Checkpoint prepare to resume checkpoint path:{load_path},states:{states}")
+                logger.info(
+                    f"Checkpoint prepare to resume checkpoint path:{load_path},states:{states}"
+                )
             else:
                 raise NotImplementedError
         else:
@@ -175,21 +179,30 @@ class PreTrainTrainer:
                 epoch_iterator = self._build_epoch_iterator(
                     dataloader, micro_step_offset
                 )
-                logger.info(f'dataloader len:{len(dataloader)},micro_step_offset:{micro_step_offset}')
+                logger.info(
+                    f"dataloader len:{len(dataloader)},micro_step_offset:{micro_step_offset}"
+                )
                 for step, (x, y) in enumerate(epoch_iterator, start=micro_step_offset):
                     x, y = (
                         x.to(self.device, non_blocking=True),
                         y.to(self.device, non_blocking=True),
                     )
-                    step_result = self._train_backend_batch(x, y)
+                    step_result = self._train_backend_batch(
+                        backend_state=backend_state,
+                        x=x,
+                        y=y,
+                        global_step=global_step,
+                        max_steps=max_steps,
+                        micro_step=step + 1,
+                    )
                     if not step_result:
                         continue
                     grad_norm = (
-                        step_result["grad_norm"]
-                        if step_result["grad_norm"] is not None
+                        step_result.grad_norm
+                        if step_result.grad_norm is not None
                         else torch.tensor(0.0, device=self.device)
                     )
-                    
+
                     if (
                         self.args.checkpoint.save_step > 0
                         and global_step % self.args.checkpoint.save_step == 0
@@ -205,22 +218,23 @@ class PreTrainTrainer:
                         self._log_swanlab(
                             {
                                 "train/step": global_step,
-                                "train/loss": step_result["log_loss"].item(),
+                                "train/loss": step_result.log_loss.item(),
                                 "train/grad_norm": grad_norm.item(),
-                                "train/lr": step_result["lr"] or 0.0,
+                                "train/lr": step_result.lr or 0.0,
                                 "train/throughput": int(tokens / (elapsed_ms / 1000)),
                             }
                         )
                         start_time = time.perf_counter()
 
                     global_step += 1
-                    
-            self._save_checkpoint(
-                checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
-                global_step=global_step,
-                epoch=epoch,
-                micro_step_in_epoch=0,
-            )
+
+            if self.args.train.epoch_num > start_epoch:
+                self._save_checkpoint(
+                    checkpoint_dir=self.args.checkpoint.save_checkpoint_dir,
+                    global_step=global_step,
+                    epoch=epoch,
+                    micro_step_in_epoch=0,
+                )
 
         finally:
             self._finish_swanlab()
@@ -289,6 +303,7 @@ class PreTrainTrainer:
                 deepspeed_train.DeepSpeedPretrainRuntime(self.args)
             )
             import logging
+
             logging.getLogger("deepspeed").setLevel(logging.INFO)
         return self._deepspeed_runtime
 
@@ -298,7 +313,7 @@ class PreTrainTrainer:
         device: torch.device,
     ):
         if self._is_deepspeed_backend():
-            return self._deepspeed_runtime.prepare(model)
+            return self._init_deepspeed().prepare(model)
         return naive_train.prepare_backend(self, model, device, None)
 
     def _get_backend_accumulation_steps(self, backend_state) -> int:
@@ -308,7 +323,7 @@ class PreTrainTrainer:
 
     def _get_batch_size_per_gpu(self) -> int:
         if self._is_deepspeed_backend():
-            return self._deepspeed_runtime.__get_batch_size_per_gpu()
+            return self._deepspeed_runtime.get_batch_size_per_gpu()
         return self.args.train.batch_size
 
     def _set_backend_train_mode(self, backend_state) -> None:
@@ -317,10 +332,27 @@ class PreTrainTrainer:
             return
         naive_train.set_train_mode(backend_state)
 
-    def _train_backend_batch(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> dict:
+    def _train_backend_batch(
+        self,
+        backend_state,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        global_step: int,
+        max_steps: int,
+        micro_step: int,
+    ) -> TrainStepOutput | None:
         if self._is_deepspeed_backend():
             return self._deepspeed_runtime.train(x=x, y=y, device=self.device)
-        return naive_train.train_batch(self, x=x, y=y, device=self.device, **kwargs)
+        return naive_train.train_batch(
+            self,
+            backend_state=backend_state,
+            x=x,
+            y=y,
+            global_step=global_step,
+            max_steps=max_steps,
+            micro_step=micro_step,
+            device=self.device,
+        )
 
     def _get_model_config(self) -> dict:
         model_config = dict(self.args.model.config)
@@ -472,7 +504,9 @@ class PreTrainTrainer:
                 "swanlab_run_id": self._swanlab_run_id,
             }
             self._deepspeed_runtime.save_checkpoint(checkpoint_dir, state, tag)
-            logger.info(f"save checkpoint global_step: {global_step} epoch: {epoch} micro_step_in_epoch:{micro_step_in_epoch} checkpoint_dir:{checkpoint_dir}")
+            logger.info(
+                f"save checkpoint global_step: {global_step} epoch: {epoch} micro_step_in_epoch:{micro_step_in_epoch} checkpoint_dir:{checkpoint_dir}"
+            )
 
         # naive_train.save_checkpoint_if_needed(
         #     self,

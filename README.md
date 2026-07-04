@@ -101,7 +101,7 @@
 ### 环境要求
 
 - Python >= 3.10
-- PyTorch >= 2.10.0
+- PyTorch >= 2.10.0（建议使用机器镜像或外部训练环境中已安装的版本）
 - CUDA (推荐) 或 MPS (Apple Silicon)
 
 ### 安装
@@ -111,12 +111,22 @@
 git clone <repo-url>
 cd llm_from_zero_to_one
 
-# 创建虚拟环境并安装依赖
+# 安装项目默认依赖；默认不会安装或替换 PyTorch/DeepSpeed
 uv sync
+
+# 如果当前环境还没有 PyTorch，可以显式安装 PyTorch extra
+uv sync --extra torch
+
+# 如果需要 DeepSpeed 后端，可以显式安装 DeepSpeed extra
+uv sync --extra deepspeed
 
 # 激活虚拟环境
 source .venv/bin/activate
 ```
+
+> 说明：`torch` 与 `deepspeed` 依赖 CUDA、驱动和机器镜像版本，项目默认不在
+> `pyproject.toml` 的基础依赖中固定它们。复用已有训练环境时，请先激活该环境，
+> 再使用 `uv run --active ...` 运行项目命令。
 
 ### 运行预训练
 

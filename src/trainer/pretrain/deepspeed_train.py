@@ -3,11 +3,15 @@ from __future__ import annotations
 import os
 from importlib import import_module
 from pathlib import Path
+from typing import Any
+
 import deepspeed
 import torch
 
-from .pretrain_args import PreTrainArgs
 from logger import get_logger
+
+from .backend_output import TrainStepOutput
+from .pretrain_args import PreTrainArgs
 
 logger = get_logger(__name__)
 
@@ -39,7 +43,7 @@ class DeepSpeedPretrainRuntime:
             return
         set_log_level_from_string(level)
 
-    def _resolve_config(self) -> str | dict[str, any]:
+    def _resolve_config(self) -> str | dict[str, Any]:
         config = self.args.train.deepspeed_config
         if not config:
             raise ValueError("train.deepspeed_config must be configured")
@@ -90,7 +94,7 @@ class DeepSpeedPretrainRuntime:
         x: torch.Tensor,
         y: torch.Tensor,
         device: torch.device,
-    ) -> dict[str, any] | None:
+    ) -> TrainStepOutput | None:
         if self.engine is None:
             raise RuntimeError("DeepSpeed runtime engine is not initialized")
         _, loss = self.engine(x, y)
@@ -105,11 +109,11 @@ class DeepSpeedPretrainRuntime:
             return None
         total_log_loss = self._accumulated_loss
         self._accumulated_loss = None
-        return {
-            "log_loss": total_log_loss,
-            "grad_norm": self._get_grad_norm(device),
-            "lr": self._get_optimizer_learning_rate(),
-        }
+        return TrainStepOutput(
+            log_loss=total_log_loss,
+            grad_norm=self._get_grad_norm(device),
+            lr=self._get_optimizer_learning_rate(),
+        )
 
     def _get_grad_norm(self, device: torch.device) -> torch.Tensor:
         if self.engine is None:
@@ -130,11 +134,18 @@ class DeepSpeedPretrainRuntime:
             return None
         return float(param_groups[0].get("lr", 0.0))
 
-    def __get_batch_size_per_gpu(self) -> int:
-        return self.engine.train_micro_batch_size_per_gpu()
+    def get_batch_size_per_gpu(self) -> int:
+        """获取每张 GPU 的 micro batch size。"""
+
+        if self.engine is None:
+            raise RuntimeError("DeepSpeed runtime engine is not initialized")
+        batch_size_getter = getattr(self.engine, "train_micro_batch_size_per_gpu", None)
+        if callable(batch_size_getter):
+            return int(batch_size_getter())
+        return int(self.args.train.batch_size)
 
     def save_checkpoint(
-        self, checkpoint_dir: str, client_state: any, tag: str | None = None
+        self, checkpoint_dir: str, client_state: Any, tag: str | None = None
     ) -> None:
         self.engine.save_checkpoint(
             save_dir=checkpoint_dir, client_state=client_state, tag=tag
@@ -143,7 +154,7 @@ class DeepSpeedPretrainRuntime:
 
     def load_checkpoint(
         self, resume_checkpoint_dir: str, resume_tag: str
-    ) -> tuple[str, any]:
+    ) -> tuple[str, Any]:
         return self.engine.load_checkpoint(
             load_dir=resume_checkpoint_dir, tag=resume_tag
         )

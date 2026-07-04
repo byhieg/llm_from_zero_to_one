@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from .backend_output import TrainStepOutput
+
 
 @dataclass
 class NaiveBackendState:
@@ -61,7 +63,7 @@ def train_batch(
     max_steps: int,
     micro_step: int,
     device: torch.device,
-) -> dict[str, Any]:
+) -> TrainStepOutput | None:
     lr = get_lr(trainer.args, global_step, max_steps)
     set_optimizer_learning_rate(backend_state.optimizer, lr)
     with _forward_context(trainer.args, device):
@@ -93,12 +95,11 @@ def train_batch(
     backend_state.optimizer.zero_grad()
     total_log_loss = backend_state.accumulated_loss
     backend_state.accumulated_loss = None
-    return {
-        "log_loss": total_log_loss,
-        "did_update": True,
-        "grad_norm": grad_norm,
-        "lr": lr,
-    }
+    return TrainStepOutput(
+        log_loss=total_log_loss,
+        grad_norm=grad_norm,
+        lr=lr,
+    )
 
 
 def save_checkpoint_if_needed(
