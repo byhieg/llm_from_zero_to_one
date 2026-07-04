@@ -125,7 +125,6 @@ class DeepSpeedPretrainRuntime:
                 return grad_norm
             if grad_norm is None:
                 return torch.tensor(0.0, device=device)
-            return torch.tensor(float(grad_norm), device=device)
         return torch.tensor(0.0, device=device)
 
     def _get_optimizer_learning_rate(self) -> float | None:
@@ -139,10 +138,7 @@ class DeepSpeedPretrainRuntime:
 
         if self.engine is None:
             raise RuntimeError("DeepSpeed runtime engine is not initialized")
-        batch_size_getter = getattr(self.engine, "train_micro_batch_size_per_gpu", None)
-        if callable(batch_size_getter):
-            return int(batch_size_getter())
-        return int(self.args.train.batch_size)
+        return self.engine.train_micro_batch_size_per_gpu()
 
     def save_checkpoint(
         self, checkpoint_dir: str, client_state: Any, tag: str | None = None

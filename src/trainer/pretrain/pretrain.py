@@ -3,6 +3,7 @@ from pathlib import Path
 import random
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from functools import partial
 from importlib import import_module
 
@@ -200,27 +201,22 @@ class PreTrainTrainer:
                         x.to(self.device, non_blocking=True),
                         y.to(self.device, non_blocking=True),
                     )
-                    step_result = self._train_backend_batch(
+                    train_step_output = self._train_backend_batch(
                         backend_state=backend_state, x=x, y=y
                     )
-                    if not step_result:
+                    if not train_step_output:
                         continue
 
                     global_step += 1
                     processed_tokens_seen += tokens_per_step
+                    completed_micro_steps_in_epoch = step + 1
                     next_epoch, next_micro_step_in_epoch = (
                         self._resolve_next_resume_position(
                             epoch=epoch,
-                            micro_step_in_epoch=step + 1,
+                            completed_micro_steps_in_epoch=completed_micro_steps_in_epoch,
                             dataloader_length=len(dataloader),
                         )
                     )
-                    grad_norm = (
-                        step_result.grad_norm
-                        if step_result.grad_norm is not None
-                        else torch.tensor(0.0, device=self.device)
-                    )
-
                     if (
                         self.args.checkpoint.save_checkpoint_dir
                         and self.args.checkpoint.save_step > 0
@@ -235,18 +231,30 @@ class PreTrainTrainer:
                         )
                     if global_step % self.args.train.log_steps == 0:
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        eta_seconds, estimated_finish_time = self._estimate_finish_time(
+                            elapsed_seconds=elapsed_ms / 1000,
+                            logged_steps=self.args.train.log_steps,
+                            global_step=global_step,
+                            max_steps=max_steps,
+                        )
                         self._log_swanlab(
                             {
                                 "train/step": global_step,
-                                "train/loss": step_result.log_loss.item(),
-                                "train/grad_norm": grad_norm.item(),
-                                "train/lr": step_result.lr or 0.0,
+                                "train/loss": train_step_output.log_loss.item(),
+                                "train/grad_norm": train_step_output.grad_norm.item(),
+                                "train/lr": train_step_output.lr or 0.0,
                                 "train/processed_tokens": processed_tokens_seen,
+                                "train/eta_seconds": eta_seconds,
                                 "train/throughput": int(
                                     train_tokens_in_log_step / (elapsed_ms / 1000)
                                 ),
                             }
                         )
+                        if self._is_main_process():
+                            logger.info(
+                                f"estimated finish time: {estimated_finish_time}, "
+                                f"remaining steps: {max_steps - global_step}"
+                            )
                         start_time = time.perf_counter()
 
                     if global_step >= max_steps:
@@ -303,11 +311,28 @@ class PreTrainTrainer:
         return max_steps
 
     def _resolve_next_resume_position(
-        self, epoch: int, micro_step_in_epoch: int, dataloader_length: int
+        self,
+        epoch: int,
+        completed_micro_steps_in_epoch: int,
+        dataloader_length: int,
     ) -> tuple[int, int]:
-        if micro_step_in_epoch >= dataloader_length:
+        if completed_micro_steps_in_epoch >= dataloader_length:
             return epoch + 1, 0
-        return epoch, micro_step_in_epoch
+        return epoch, completed_micro_steps_in_epoch
+
+    def _estimate_finish_time(
+        self,
+        elapsed_seconds: float,
+        logged_steps: int,
+        global_step: int,
+        max_steps: int,
+    ) -> tuple[int, str]:
+        if elapsed_seconds <= 0 or logged_steps <= 0:
+            return 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        remaining_steps = max(max_steps - global_step, 0)
+        eta_seconds = int((elapsed_seconds / logged_steps) * remaining_steps)
+        estimated_finish_time = datetime.now() + timedelta(seconds=eta_seconds)
+        return eta_seconds, estimated_finish_time.strftime("%Y-%m-%d %H:%M:%S")
 
     def _build_distributed(self) -> None:
         if not dist.is_initialized():
@@ -557,6 +582,7 @@ class PreTrainTrainer:
         if not checkpoint_dir:
             return
         if self._is_deepspeed_backend():
+            checkpoint_tag = tag or f"global_step{global_step}"
             state = {
                 "global_step": global_step,
                 "start_epoch": start_epoch,
@@ -564,11 +590,14 @@ class PreTrainTrainer:
                 "swanlab_run_id": self._swanlab_run_id,
                 "processed_tokens_seen": processed_tokens_seen,
             }
-            self._deepspeed_runtime.save_checkpoint(checkpoint_dir, state, tag)
+            self._deepspeed_runtime.save_checkpoint(
+                checkpoint_dir, state, checkpoint_tag
+            )
             logger.info(
                 f"save checkpoint global_step: {global_step} start_epoch: {start_epoch} "
                 f"start_micro_step_in_epoch:{start_micro_step_in_epoch} "
-                f"processed_tokens_seen:{processed_tokens_seen} checkpoint_dir:{checkpoint_dir}"
+                f"processed_tokens_seen:{processed_tokens_seen} tag:{checkpoint_tag} "
+                f"checkpoint_dir:{checkpoint_dir}"
             )
 
         # naive_train.save_checkpoint_if_needed(

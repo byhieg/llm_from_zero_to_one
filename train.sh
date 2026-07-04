@@ -10,7 +10,7 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
 NUM_GPUS=2  # 根据你的 GPU 数量修改
 
 # 配置文件路径
-CONFIG_PATH="/root/llm_from_zero_to_one/configs/autodl_pretrain_minimind_deepspeed_zero0.yaml" 
+CONFIG_PATH="/root/llm_from_zero_to_one/configs/autodl_pretrain_minimind_deepspeed.yaml" 
 
 # 使用 torchrun 启动训练
 torchrun \
