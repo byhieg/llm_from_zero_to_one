@@ -50,6 +50,9 @@ torch = [
 deepspeed = [
     "deepspeed>=0.19.2",
 ]
+swanlab = [
+    "swanlab>=0.6.0",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

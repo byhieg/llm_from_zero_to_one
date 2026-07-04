@@ -117,6 +117,9 @@ uv sync --extra torch
 # 如果需要 DeepSpeed 后端，可以显式安装 DeepSpeed extra
 uv sync --extra deepspeed
 
+# 如果需要 SwanLab 实验跟踪，可以显式安装 SwanLab extra
+uv sync --extra swanlab
+
 # 激活虚拟环境
 source .venv/bin/activate
 ```
