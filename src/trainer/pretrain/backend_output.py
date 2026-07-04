@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import torch
 
@@ -17,5 +16,3 @@ class TrainStepOutput:
     log_loss: torch.Tensor
     grad_norm: torch.Tensor | None = None
     lr: float | None = None
-    did_update: bool = True
-    extra: dict[str, Any] = field(default_factory=dict)
