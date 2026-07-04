@@ -27,28 +27,27 @@ _RESET = "\033[0m"
 class _ColorFormatter(logging.Formatter):
     def __init__(self, fmt: str | None = None, datefmt: str | None = None):
         if fmt is None:
-            fmt = "%(asctime)s | %(color)s%(levelname)-8s%(reset)s | %(name)s | %(message)s"
+            fmt = "%(asctime)s | %(color)s%(levelname)-8s%(reset)s | rank=%(rank)s | %(name)s | %(message)s"
         super().__init__(fmt=fmt, datefmt=datefmt)
 
     def format(self, record: logging.LogRecord) -> str:
         record.color = _LEVEL_COLORS.get(record.levelno, "")  # type: ignore[attr-defined]
         record.reset = _RESET  # type: ignore[attr-defined]
+        record.rank = _get_rank()  # type: ignore[attr-defined]
         return super().format(record)
 
 
 class _PlainFormatter(logging.Formatter):
     def __init__(self, fmt: str | None = None, datefmt: str | None = None):
         if fmt is None:
-            fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+            fmt = (
+                "%(asctime)s | %(levelname)-8s | rank=%(rank)s | %(name)s | %(message)s"
+            )
         super().__init__(fmt=fmt, datefmt=datefmt)
 
-
-class _InjectRankFilter(logging.Filter):
-    """为日志记录补充当前 rank 信息。"""
-
-    def filter(self, record: logging.LogRecord) -> bool:
+    def format(self, record: logging.LogRecord) -> str:
         record.rank = _get_rank()  # type: ignore[attr-defined]
-        return True
+        return super().format(record)
 
 
 def _get_rank() -> int:
@@ -141,7 +140,6 @@ def init_logger(
             encoding="utf-8",
         )
         file_handler.setLevel(numeric_level)
-        file_handler.addFilter(_InjectRankFilter())
         file_handler.setFormatter(_PlainFormatter(fmt=file_fmt))
         root_logger.addHandler(file_handler)
 
